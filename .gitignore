@@ -18,3 +18,4 @@ coordinator.env
 graph.json
 graph.graphml
 *.manifest.jsonl
+gemini-code-*.md
