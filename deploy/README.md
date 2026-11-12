@@ -43,7 +43,24 @@ State (`grid_state.db`, `output_graph.jsonl`) lives in `/var/lib/nightshift` (`S
 The unit runs as user `nightshift` with `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`,
 `NoNewPrivileges` and a `@system-service` syscall filter. Open TCP 8000 to the worker subnet only.
 Logs: `journalctl -u nightshift-coordinator -f`. To try it without systemd, run
-`GRID_WORKER_TOKEN=… GRID_CLIENT_TOKEN=… python coordinator.py --host 0.0.0.0 --port 8000 --output output_graph.jsonl --db grid_state.db`.
+`GRID_WORKER_TOKEN=… GRID_CLIENT_TOKEN=… python coordinator.py --host 0.0.0.0 --port 8000 --output output_graph.jsonl --db grid_state.db --auto-tls`.
+
+The unit passes `--auto-tls`, so the coordinator serves HTTPS with a self-signed certificate kept in
+`/var/lib/nightshift`. It prints the certificate's fingerprint (`TLS fingerprint: sha256:…`) at
+startup; find it with `journalctl -u nightshift-coordinator | grep fingerprint`. Workers that use
+`--discover` pick the fingerprint up automatically. Workers given an explicit `--coordinator https://…`
+need `--tls-fingerprint sha256:…`.
+
+**Per-worker credentials.** On a LAN bind, workers don't get the master worker token. Instead, mint
+one credential per machine on the coordinator host and install that:
+
+```bash
+python grid_auth.py issue --id node-office-pc --worker-token-file /var/lib/nightshift/worker.token --out node-office-pc.credential
+# copy node-office-pc.credential to that machine, then:
+deploy/install_worker.sh --coordinator https://10.0.0.5:8000 --tls-fingerprint sha256:… --id node-office-pc --token-file node-office-pc.credential
+```
+
+A stolen credential can impersonate only that one node. To revoke every credential at once, rotate the master token.
 
 ## 3. Workers
 

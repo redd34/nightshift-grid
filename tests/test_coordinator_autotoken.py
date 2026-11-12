@@ -72,7 +72,7 @@ def run_main(monkeypatch):
     captured = {}
 
     def fake_run(app, host, port, **kw):
-        captured.update(app=app, host=host, port=port)
+        captured.update(app=app, host=host, port=port, **kw)
 
     monkeypatch.setattr(uvicorn, "run", fake_run)
 
@@ -92,11 +92,13 @@ def test_lan_bind_with_auto_token_starts_and_advertises(tmp_path, run_main, caps
     db = tmp_path / "state" / "g.db"
     db.parent.mkdir()
     cap = run_main(["--host", "0.0.0.0", "--port", "8845", "--db", str(db), "--output", "none", "--auto-token",
-                    "--discovery-port", "0"])
+                    "--auto-tls", "--discovery-port", "0"])
     assert cap["host"] == "0.0.0.0"
     assert (db.parent / "worker.token").exists() and (db.parent / "client.token").exists()
+    assert cap["ssl_certfile"].endswith("coordinator-cert.pem") and cap["ssl_keyfile"].endswith("coordinator-key.pem")
     err = capsys.readouterr().err
-    assert "discovery: advertising http://" in err and ":8845" in err
+    assert "discovery: advertising https://" in err and ":8845" in err
+    assert "TLS fingerprint: sha256:" in err
     cap["app"].state.grid.store.close()
 
 
@@ -106,7 +108,8 @@ def test_loopback_default_does_not_advertise(tmp_path, run_main, capsys):
 
 
 def test_no_advertise_flag(tmp_path, run_main, capsys):
-    run_main(["--host", "0.0.0.0", "--db", "none", "--output", "none", "--auto-token", "--no-advertise"])
+    run_main(["--host", "0.0.0.0", "--db", "none", "--output", "none", "--auto-token", "--no-advertise",
+              "--allow-plaintext"])
     assert "discovery" not in capsys.readouterr().err
 
 

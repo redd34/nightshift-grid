@@ -8,13 +8,17 @@ Protocol (version 1, UTF-8 JSON, one datagram each way)
 --------------------------------------------------------
 probe (worker -> broadcast:47474)::
 
-    {"v":1,"type":"nightshift.discover","nonce":"<32 hex>","pad":"...."}
+    {"v":1,"type":"nightshift.discover","nonce":"<32 hex>","wid":"<worker id>"?,"pad":"...."}
 
 reply (coordinator -> unicast to the probe's source address)::
 
-    {"v":1,"type":"nightshift.coordinator","url":"http://10.0.0.5:8000","nonce":"<echo>",
-     "proof":"<hex HMAC-SHA256(worker_token, LABEL || nonce || '\\n' || url)>" | null,
+    {"v":1,"type":"nightshift.coordinator","url":"https://10.0.0.5:8000","nonce":"<echo>",
+     "tls":"sha256:<hex>" | null,
+     "proof":"<hex HMAC-SHA256(key, LABEL || nonce || '\\n' || url [|| '\\n' || tls])>" | null,
      "auth": true|false}
+
+`key` is the worker's bearer secret: the master worker token, or - when the probe names a
+`wid` - that worker's per-worker credential, which the coordinator re-derives from the master.
 
 Security properties
 -------------------
@@ -25,6 +29,8 @@ Security properties
   can't forge a proof. It can't replay an old reply either (the nonce is fresh per probe), and
   it can't relay a real reply with its own URL substituted (the URL is inside the MAC). The
   HMAC reveals nothing about the key.
+* **TLS pinning for free.** The certificate fingerprint is inside the MAC, so a worker that
+  discovers the coordinator also learns, authenticated, which certificate to pin.
 * **Tokenless workers** can't verify anything, so they accept unproven replies. That is
   logged as a warning; it's only safe on a trusted network.
 * **Ambiguity is an error.** If two different coordinators prove themselves, we raise rather
@@ -70,8 +76,19 @@ class DiscoveryError(RuntimeError):
 
 
 # --------------------------------------------------------------------------- shared helpers
-def compute_proof(token: str, nonce: str, url: str) -> str:
-    return hmac.new(token.encode(), MAC_LABEL + nonce.encode() + b"\n" + url.encode(), hashlib.sha256).hexdigest()
+def compute_proof(token: str, nonce: str, url: str, tls_fingerprint: Optional[str] = None) -> str:
+    msg = MAC_LABEL + nonce.encode() + b"\n" + url.encode()
+    if tls_fingerprint:
+        msg += b"\n" + tls_fingerprint.encode()
+    return hmac.new(token.encode(), msg, hashlib.sha256).hexdigest()
+
+
+def _valid_fingerprint(fp: object) -> bool:
+    return isinstance(fp, str) and fp.startswith("sha256:") and _is_hex(fp[7:], 64, 64)
+
+
+def _valid_wid(wid: object) -> bool:
+    return isinstance(wid, str) and 0 < len(wid) <= 128 and all(0x21 <= ord(c) < 0x7F for c in wid)
 
 
 def _is_hex(s: object, lo: int, hi: int) -> bool:
@@ -90,7 +107,8 @@ def _valid_url(url: object) -> bool:
     try:
         parts = urlsplit(url)
         _ = parts.port  # raises ValueError on a non-numeric/out-of-range port
-        return parts.scheme in ("http", "https") and bool(parts.hostname) and not (parts.query or parts.fragment)
+        return (parts.scheme in ("http", "https") and bool(parts.hostname) and not (parts.query or parts.fragment)
+                and not any(c.isspace() or ord(c) < 0x20 for c in url))
     except ValueError:
         return False
 
@@ -228,11 +246,15 @@ class DiscoveryResponder(asyncio.DatagramProtocol):
     `proof: null, auth: false` and only tokenless workers will accept them."""
 
     def __init__(self, advertise_url: str, worker_token: Optional[str], *, bind_host: str = "",
-                 port: int = DISCOVERY_PORT, limiter: Optional[RateLimiter] = None):
+                 port: int = DISCOVERY_PORT, limiter: Optional[RateLimiter] = None,
+                 tls_fingerprint: Optional[str] = None):
         if not _valid_url(advertise_url):
             raise ValueError(f"invalid advertise URL {advertise_url!r} (need http(s)://host:port, <= {MAX_URL_CHARS} chars)")
+        if tls_fingerprint is not None and not _valid_fingerprint(tls_fingerprint):
+            raise ValueError(f"invalid TLS fingerprint {tls_fingerprint!r}")
         self.advertise_url = advertise_url
         self.worker_token = worker_token
+        self.tls_fingerprint = tls_fingerprint
         self.bind_host = bind_host
         self.port = port
         self.limiter = limiter or RateLimiter()
@@ -271,9 +293,18 @@ class DiscoveryResponder(asyncio.DatagramProtocol):
             self.stats["dropped_rate"] += 1
             return None
         nonce = probe["nonce"]
+        key = self.worker_token
+        wid = probe.get("wid")
+        if key and wid is not None:
+            if not _valid_wid(wid):
+                self.stats["dropped_malformed"] += 1
+                return None
+            from grid_auth import derive_worker_credential  # lazy: keeps this module stdlib-only for workers
+            key = derive_worker_credential(key, wid)
         reply = _encode({
             "v": PROTOCOL_VERSION, "type": REPLY_TYPE, "url": self.advertise_url, "nonce": nonce,
-            "proof": compute_proof(self.worker_token, nonce, self.advertise_url) if self.worker_token else None,
+            "tls": self.tls_fingerprint,
+            "proof": compute_proof(key, nonce, self.advertise_url, self.tls_fingerprint) if key else None,
             "auth": self.worker_token is not None,
         })
         if len(reply) > MAX_AMPLIFICATION * len(data):
@@ -301,11 +332,22 @@ class DiscoveredCoordinator:
     source: str        # IP the reply came from
     verified: bool     # proof checked against our token
     auth: bool         # the coordinator says it requires tokens
+    tls_fingerprint: Optional[str] = None  # certificate to pin (authenticated iff verified)
 
 
-def make_probe(nonce: str) -> bytes:
-    """A padded probe. Padding is what lets the responder enforce its 2x amplification cap."""
+def _worker_id_of(token: Optional[str]) -> Optional[str]:
+    if not token:
+        return None
+    from grid_auth import credential_worker_id
+    return credential_worker_id(token)
+
+
+def make_probe(nonce: str, worker_id: Optional[str] = None) -> bytes:
+    """A padded probe. Padding is what lets the responder enforce its 2x amplification cap.
+    `worker_id` (for per-worker credentials) tells the coordinator which key to prove with."""
     base = {"v": PROTOCOL_VERSION, "type": PROBE_TYPE, "nonce": nonce, "pad": ""}
+    if worker_id is not None:
+        base["wid"] = worker_id
     need = PROBE_PAD_TO - len(_encode(base))
     base["pad"] = "0" * max(0, need)
     return _encode(base)
@@ -321,7 +363,7 @@ def discover_all(worker_token: Optional[str], timeout: float = 3.0, port: int = 
     The probe is re-sent `retransmits` times, evenly spaced, because broadcast UDP is lossy
     on Wi-Fi. All copies share one nonce, so duplicate replies collapse by URL."""
     nonce = os.urandom(16).hex()
-    probe = make_probe(nonce)
+    probe = make_probe(nonce, _worker_id_of(worker_token))
     targets = list(targets) if targets is not None else broadcast_targets()
     accepted: dict[str, DiscoveredCoordinator] = {}
     rejected: list[str] = []
@@ -375,15 +417,24 @@ def _check_reply(data: bytes, source: str, nonce: str, worker_token: Optional[st
         return f"{source}: invalid url"
     auth = msg.get("auth") is True
     proof = msg.get("proof")
+    tls = msg.get("tls")
+    if tls is not None and not _valid_fingerprint(tls):
+        return f"{source}: invalid tls fingerprint"
     if worker_token:
-        if not isinstance(proof, str) or not hmac.compare_digest(proof, compute_proof(worker_token, nonce, url)):
+        if not isinstance(proof, str) or not hmac.compare_digest(proof, compute_proof(worker_token, nonce, url, tls)):
             return f"{source}: {url} did not prove knowledge of our worker token"
-        return DiscoveredCoordinator(url, source, verified=True, auth=auth)
-    return DiscoveredCoordinator(url, source, verified=False, auth=auth)
+        return DiscoveredCoordinator(url, source, verified=True, auth=auth, tls_fingerprint=tls)
+    return DiscoveredCoordinator(url, source, verified=False, auth=auth, tls_fingerprint=tls)
 
 
 def discover_coordinator(worker_token: Optional[str], timeout: float = 3.0, port: int = DISCOVERY_PORT,
                          targets: Optional[Iterable[str]] = None) -> str:
+    """Base URL of the single coordinator on the LAN (see `discover_coordinator_info`)."""
+    return discover_coordinator_info(worker_token, timeout=timeout, port=port, targets=targets).url
+
+
+def discover_coordinator_info(worker_token: Optional[str], timeout: float = 3.0, port: int = DISCOVERY_PORT,
+                              targets: Optional[Iterable[str]] = None) -> DiscoveredCoordinator:
     """Find exactly one coordinator on the LAN and return its base URL.
 
     With a token, only coordinators that prove they hold the same worker token are accepted.
@@ -406,4 +457,4 @@ def discover_coordinator(worker_token: Optional[str], timeout: float = 3.0, port
             log.warning("discovery: %s requires a worker token, but this worker has none; requests will get 401", c.url)
     for r in rejected:
         log.warning("discovery: ignored reply %s", r)
-    return c.url
+    return c

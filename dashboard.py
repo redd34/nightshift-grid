@@ -23,6 +23,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from grid_auth import CLIENT_TOKEN_ENV, GridAuthError, bearer_headers, check_auth, resolve_token
+from grid_tls import client_verify
 
 COORDINATOR_URL = "http://127.0.0.1:8000"
 console = Console()
@@ -103,7 +104,8 @@ async def dashboard_loop(url: str, token: Optional[str], *, should_stop: Optiona
                          interval: float = 0.3, footer: str = "") -> None:
     """Poll `/v1/grid/status` and redraw until cancelled or `should_stop()` returns True."""
     hint = f"Set --token-file or {' / '.join(CLIENT_TOKEN_ENV)} (client token)."
-    async with httpx.AsyncClient(base_url=url, headers=bearer_headers(token)) as client:
+    verify = await asyncio.to_thread(client_verify, url)
+    async with httpx.AsyncClient(base_url=url, headers=bearer_headers(token), verify=verify) as client:
         with Live(console=console, refresh_per_second=4, screen=False) as live:
             while not (should_stop and should_stop()):
                 try:

@@ -4,7 +4,7 @@
 Take the Nightshift Grid PoC from an in-memory demo to a crash-resilient, zero-config local AI engine that can be triggered directly from AI IDEs (Claude Code, Kiro, Cursor) via MCP. Close all remaining gaps identified in the Phase 1 review.
 
 > **Status (2026-11-12): all six sections are complete.**
-> - 338 tests pass.
+> - 361 tests pass.
 > - The live 4-phase chaos benchmark on `qwen3:4b` passes all 9 checks with 96/96 records, 0 missing and 0 duplicates.
 >
 > Legend: `[x]` done · `[~]` done differently from the spec (see note).
@@ -107,8 +107,9 @@ Take the Nightshift Grid PoC from an in-memory demo to a crash-resilient, zero-c
    - Without proof of the token, discovery could leak tokens to a rogue host. The HMAC proof prevents this.
 
 ### Still open (outside this checklist)
-- **No TLS.** Bearer tokens travel in cleartext, so use Tailscale/WireGuard or a TLS reverse proxy.
-- **A worker token can still register new worker ids.** Live ids are now protected by per-registration sessions.
+- ~~**No TLS.**~~ *Fixed:* a LAN bind serves HTTPS (`--auto-tls` or `--tls-cert/--tls-key`) and refuses plaintext unless `--allow-plaintext` is passed. Clients pin the fingerprint, which `--discover` delivers inside the HMAC proof.
+- ~~**A worker token can still register new worker ids.**~~ *Fixed:* LAN workers use per-worker credentials, `HMAC(master, worker_id)`, which are valid for one id only (`python grid_auth.py issue`). The master token is no longer accepted from workers (`--worker-auth`).
+- **Results aren't cross-checked.** A compromised worker can still return bad extractions for chunks it leases.
 - **Single coordinator.** It's durable but not highly available.
 - **Qdrant backfill after a SIGKILL.** Records still in the sink queue when the coordinator is SIGKILLed (under a second's worth) need `backfill`.
 - **Not run on real hardware:** the Linux, Windows and Wayland sensors and installers, battery and thermal guards (tested with fakes only), live `keep_alive: 0` under real memory pressure, and multi-NIC discovery.

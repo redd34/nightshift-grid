@@ -6,6 +6,7 @@ from typing import Optional
 import httpx
 
 from grid_auth import CLIENT_TOKEN_ENV, GridAuthError, bearer_headers, check_auth, resolve_token
+from grid_tls import client_verify
 
 SAMPLE_CHUNKS = [
     f"Equipment Log #{i}: Compressor turbine vibration exceeded 4.2 mm/s on PLC-Node-{i % 4} during shift handover. "
@@ -20,10 +21,15 @@ def _headers(token: Optional[str]) -> dict[str, str]:
     return bearer_headers(token if token is not None else resolve_token(None, CLIENT_TOKEN_ENV)[0])
 
 
+def _tls(coordinator: str) -> dict:
+    """httpx `verify=` for an https coordinator (pinned fingerprint / CA file from the environment)."""
+    return {"verify": client_verify(coordinator)} if coordinator.lower().startswith("https://") else {}
+
+
 def submit(coordinator: str, chunks=SAMPLE_CHUNKS, required_tier: int = 1,
            job_name: str = f"Industrial Maintenance GraphRAG Ingestion ({len(SAMPLE_CHUNKS)} Chunks)",
            token: Optional[str] = None) -> dict:
-    r = httpx.post(f"{coordinator}/v1/grid/mapreduce", timeout=10, headers=_headers(token),
+    r = httpx.post(f"{coordinator}/v1/grid/mapreduce", timeout=10, headers=_headers(token), **_tls(coordinator),
                    json={"job_name": job_name, "chunks": list(chunks), "required_tier": required_tier})
     check_auth(r, AUTH_HINT)
     r.raise_for_status()
@@ -34,7 +40,7 @@ def wait(coordinator: str, job_id: str, timeout: float = 900, token: Optional[st
     headers = _headers(token)
     deadline = time.time() + timeout
     while time.time() < deadline:
-        r = httpx.get(f"{coordinator}/v1/grid/jobs/{job_id}", timeout=5, headers=headers)
+        r = httpx.get(f"{coordinator}/v1/grid/jobs/{job_id}", timeout=5, headers=headers, **_tls(coordinator))
         check_auth(r, AUTH_HINT)
         r.raise_for_status()
         st = r.json()

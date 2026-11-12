@@ -172,4 +172,4 @@ An MCP tool that reads local files and sends them to a server is a **prompt-inje
    - 422: the coordinator's reason;
    - timeouts: the job id, so you can follow it with `grid_status`.
 
-Not covered: there is no TLS to the coordinator (see the README's known limitations), so on a LAN, tokens and chunk text travel in cleartext. Content-level secrets inside an allowed file are not detected; the checks are by path only.
+For an `https://` coordinator, set `NIGHTSHIFT_TLS_FINGERPRINT=sha256:…` (printed by the coordinator at startup) or `NIGHTSHIFT_CA_FILE` in the MCP server's environment. The certificate is verified before the client token is sent. Not covered: content-level secrets inside an allowed file are not detected; the checks are by path only.

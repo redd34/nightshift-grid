@@ -32,6 +32,8 @@ param(
     [switch]$AllowNoIdleSensor,               # run even if GetLastInputInfo can't see input (fail-open)
     [switch]$AllowBattery,
     [string]$Ollama = 'http://127.0.0.1:11434',
+    [string]$TlsFingerprint = $env:NIGHTSHIFT_TLS_FINGERPRINT,  # pin the coordinator cert (sha256:<hex>)
+    [string]$CaFile,                          # or verify it against this CA / certificate file
     [string]$Python,                          # python.exe >= 3.11 (default: py launcher / PATH)
     [switch]$PullModel,
     [switch]$NoStart,
@@ -157,6 +159,11 @@ try {
 $argv = @('--id', $WorkerId, '--coordinator', $Coordinator, '--model', $Model,
           '--ollama', $Ollama, '--token-file', $TokenPath)
 if ($Tier) { $argv += @('--tier', $Tier) }
+if ($TlsFingerprint) { $argv += @('--tls-fingerprint', $TlsFingerprint) }
+if ($CaFile) { $argv += @('--ca-file', (Resolve-Path $CaFile).Path) }
+if (($TlsFingerprint -or $CaFile) -and -not $Coordinator.StartsWith('https://')) {
+    throw "-TlsFingerprint/-CaFile need an https:// coordinator"
+}
 if ($NativeIdleSeconds -gt 0) { $argv += @('--native-idle-seconds', "$NativeIdleSeconds") }
 if ($CpuBusyPercent -ge 0) { $argv += @('--max-host-cpu-pct', "$CpuBusyPercent") }
 if ($MinFreeRamGb -ge 0) { $argv += @('--min-free-ram-gb', "$MinFreeRamGb") }

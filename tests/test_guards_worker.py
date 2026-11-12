@@ -221,6 +221,11 @@ def fake_discovery(monkeypatch, behaviour):
         mod.calls.append((worker_token, timeout))
         return behaviour()
     mod.discover_coordinator = discover_coordinator
+
+    def discover_coordinator_info(worker_token, timeout=3.0, **kw):
+        res = discover_coordinator(worker_token, timeout)
+        return res if hasattr(res, "url") else types.SimpleNamespace(url=res, tls_fingerprint=None)
+    mod.discover_coordinator_info = discover_coordinator_info
     monkeypatch.setitem(sys.modules, "discovery", mod)
     return mod
 

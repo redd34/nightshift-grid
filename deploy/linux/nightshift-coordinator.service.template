@@ -20,7 +20,7 @@ StateDirectoryMode=0750
 WorkingDirectory=/var/lib/nightshift
 EnvironmentFile=/etc/nightshift/coordinator.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=@INSTALL_DIR@/.venv/bin/python @INSTALL_DIR@/coordinator.py --host 0.0.0.0 --port @PORT@ --output /var/lib/nightshift/output_graph.jsonl --db /var/lib/nightshift/grid_state.db
+ExecStart=@INSTALL_DIR@/.venv/bin/python @INSTALL_DIR@/coordinator.py --host 0.0.0.0 --port @PORT@ --output /var/lib/nightshift/output_graph.jsonl --db /var/lib/nightshift/grid_state.db --auto-tls
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=20

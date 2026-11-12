@@ -26,6 +26,8 @@ MEMORY_HIGH="${NIGHTSHIFT_MEMORY_HIGH:-}"
 THROTTLE_SECONDS="${NIGHTSHIFT_THROTTLE_SECONDS:-60}"
 PYTHON_BIN="${NIGHTSHIFT_PYTHON:-}"
 TOKEN_SRC_FILE=""
+TLS_FINGERPRINT="${NIGHTSHIFT_TLS_FINGERPRINT:-}"
+CA_FILE=""
 TOKEN_STDIN=0
 ALLOW_BATTERY=0
 ALLOW_NO_IDLE_SENSOR=0
@@ -46,7 +48,11 @@ usage() {
 Usage: install_worker.sh [options]
 
 Required (unless --uninstall):
-  --coordinator URL        Coordinator base URL, e.g. http://10.0.0.5:8000  [env NIGHTSHIFT_COORDINATOR]
+  --coordinator URL        Coordinator base URL, e.g. https://10.0.0.5:8000  [env NIGHTSHIFT_COORDINATOR]
+
+TLS (a LAN coordinator serves HTTPS; it prints its fingerprint at startup):
+  --tls-fingerprint SHA    Pin the coordinator certificate (sha256:<hex>)  [env NIGHTSHIFT_TLS_FINGERPRINT]
+  --ca-file PATH           Or verify it against this CA / certificate file (absolute path)
 
 Worker:
   --id ID                  Worker id (default: node-<sanitized short hostname>)
@@ -62,9 +68,11 @@ Worker:
   --worker-arg ARG         Extra argument passed to worker_daemon.py (repeatable)
   --ollama URL             Ollama URL to check (default: http://127.0.0.1:11434)
 
-Token (written to <config-dir>/worker.token, mode 0600; kept if already present):
-  --token-file PATH        Read the token from PATH
-  --token-stdin            Read the token from stdin (first line)
+Credential (written to <config-dir>/worker.token, mode 0600; kept if already present).
+Use a per-worker credential minted on the coordinator host, not the master worker token:
+  python grid_auth.py issue --id <worker-id> --worker-token-file <state>/worker.token --out <id>.credential
+  --token-file PATH        Read the credential from PATH
+  --token-stdin            Read the credential from stdin (first line)
 
 Install:
   --install-dir DIR        Code + venv location (default: ~/.local/share/nightshift)
@@ -114,6 +122,8 @@ while [ "$#" -gt 0 ]; do
     --ollama)              need_arg "$@"; OLLAMA_URL="$2"; shift 2 ;;
     --token-file)          need_arg "$@"; TOKEN_SRC_FILE="$2"; shift 2 ;;
     --token-stdin)         TOKEN_STDIN=1; shift ;;
+    --tls-fingerprint)     need_arg "$@"; TLS_FINGERPRINT="$2"; shift 2 ;;
+    --ca-file)             need_arg "$@"; CA_FILE="$2"; shift 2 ;;
     --install-dir)         need_arg "$@"; INSTALL_DIR="$2"; shift 2 ;;
     --config-dir)          need_arg "$@"; CONFIG_DIR="$2"; shift 2 ;;
     --python)              need_arg "$@"; PYTHON_BIN="$2"; shift 2 ;;
@@ -219,6 +229,16 @@ fi
 [ -n "${COORDINATOR}" ] || { usage >&2; die "--coordinator is required"; }
 case "${COORDINATOR}" in http://*|https://*) ;; *) die "--coordinator must start with http:// or https://" ;; esac
 COORDINATOR="${COORDINATOR%/}"
+case "${COORDINATOR}" in
+  http://127.0.0.1*|http://localhost*|http://\[::1\]*|https://*) ;;
+  http://*) warn "plain-http coordinator ${COORDINATOR}: tokens cross the network unencrypted (fine only on Tailscale/WireGuard)" ;;
+esac
+if [ -n "${TLS_FINGERPRINT}${CA_FILE}" ]; then
+  case "${COORDINATOR}" in https://*) ;; *) die "--tls-fingerprint/--ca-file need an https:// coordinator" ;; esac
+fi
+if [ -n "${CA_FILE}" ]; then
+  case "${CA_FILE}" in /*) ;; *) die "--ca-file must be an absolute path (the service runs from another directory)" ;; esac
+fi
 
 if [ -z "${WORKER_ID}" ]; then
   host=""
@@ -263,6 +283,8 @@ WORKER_ARGV=("${VENV_PY}" "${INSTALL_DIR}/worker_daemon.py"
   --id "${WORKER_ID}" --coordinator "${COORDINATOR}" --model "${MODEL}"
   --ollama "${OLLAMA_URL}" --token-file "${TOKEN_FILE}")
 if [ -n "${TIER}" ]; then WORKER_ARGV+=(--tier "${TIER}"); fi
+if [ -n "${TLS_FINGERPRINT}" ]; then WORKER_ARGV+=(--tls-fingerprint "${TLS_FINGERPRINT}"); fi
+if [ -n "${CA_FILE}" ]; then WORKER_ARGV+=(--ca-file "${CA_FILE}"); fi
 if [ "${NATIVE_IDLE_SECONDS}" != "0" ]; then WORKER_ARGV+=(--native-idle-seconds "${NATIVE_IDLE_SECONDS}"); fi
 if [ -n "${CPU_BUSY_PERCENT}" ]; then WORKER_ARGV+=(--max-host-cpu-pct "${CPU_BUSY_PERCENT}"); fi
 if [ -n "${MIN_FREE_RAM_GB}" ]; then WORKER_ARGV+=(--min-free-ram-gb "${MIN_FREE_RAM_GB}"); fi

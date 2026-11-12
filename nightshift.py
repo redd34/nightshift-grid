@@ -150,6 +150,17 @@ class StateDir:
         self.session_file.unlink(missing_ok=True)
 
 
+def _loopback_host(host: str) -> bool:
+    import ipaddress
+
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def resolve_endpoint(state: StateDir, coordinator: Optional[str], token_file: Optional[str]) -> tuple[str, Optional[str]]:
     """(url, client token) for client commands. Precedence: explicit flags, then the state dir
     written by `up` (the matching pair for the grid it started), then the environment."""
@@ -157,6 +168,10 @@ def resolve_endpoint(state: StateDir, coordinator: Optional[str], token_file: Op
 
     session = state.read_session() or {}
     url = coordinator or session.get("url") or f"http://127.0.0.1:{DEFAULT_PORT}"
+    if session.get("ca_file") and url == session.get("url"):
+        from grid_tls import CA_FILE_ENV, FINGERPRINT_ENV
+        if not (os.environ.get(CA_FILE_ENV) or os.environ.get(FINGERPRINT_ENV)):
+            os.environ[CA_FILE_ENV] = session["ca_file"]  # the self-signed cert `up` minted; children inherit it
     if token_file:
         try:
             return url, resolve_token(token_file, CLIENT_TOKEN_ENV)[0]
@@ -374,7 +389,13 @@ def cmd_up(a: argparse.Namespace) -> int:
     state.ensure_token("client")
     client_token = state.read_token("client")
 
-    url = f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '::') else a.host}:{a.port}"
+    # A LAN-reachable grid serves TLS (the coordinator refuses plaintext there); local clients verify
+    # it against the self-signed cert in the state dir, which also carries a 127.0.0.1 SAN.
+    tls = not _loopback_host(a.host)
+    scheme = "https" if tls else "http"
+    url = f"{scheme}://{'127.0.0.1' if a.host in ('0.0.0.0', '::') else a.host}:{a.port}"
+    cert_file = state.path / "coordinator-cert.pem"
+    session_extra = {"ca_file": str(cert_file)} if tls else {}
     sup = Supervisor(state)
     atexit.register(sup.teardown)
     # SIGTERM/SIGHUP behave like Ctrl-C so `finally` runs teardown. SIGINT is (re)installed too:
@@ -389,25 +410,41 @@ def cmd_up(a: argparse.Namespace) -> int:
                 "--client-token-file", str(state.token_path("client"))]
         if has_flag(coord_help, "--no-advertise") and not a.advertise:
             argv.append("--no-advertise")
+        if tls:
+            argv.append("--auto-tls")
         sup.coordinator = sup.spawn("coordinator", argv)
-        sup.record_session(url=url, host=a.host, port=a.port, mode="mock" if a.mock else a.model)
-        _wait(lambda: httpx.get(f"{url}/healthz", timeout=1).status_code == 200, 20, "coordinator /healthz", sup)
+        sup.record_session(url=url, host=a.host, port=a.port, mode="mock" if a.mock else a.model, **session_extra)
+        if tls:
+            from grid_tls import CA_FILE_ENV
+            _wait(cert_file.exists, 20, f"TLS certificate {cert_file}", sup)
+            os.environ[CA_FILE_ENV] = str(cert_file)  # inherited by workers and used by our own requests
+        from grid_tls import client_verify
+        _wait(lambda: httpx.get(f"{url}/healthz", timeout=1, verify=client_verify(url)).status_code == 200,
+              20, "coordinator /healthz", sup)
+
+        from grid_auth import derive_worker_credential, write_secret_file
+        cred_dir = state.path / "credentials"
+        cred_dir.mkdir(mode=0o700, exist_ok=True)
+        master = state.read_token("worker")
 
         for wid, tier in worker_specs(a.workers):
+            # Each local worker gets a credential bound to its own id, never the master worker token.
+            cred = cred_dir / f"{wid}.credential"
+            write_secret_file(str(cred), derive_worker_credential(master, wid), force=True)
             wargv = ["worker_daemon.py", "--id", wid, "--tier", str(tier), "--coordinator", url,
-                     "--token-file", str(state.token_path("worker"))]
+                     "--token-file", str(cred)]
             wargv += ["--mock"] if a.mock else ["--model", a.model, "--ollama", a.ollama]
             if a.allow_battery:
                 wargv.append("--allow-battery")
             for extra in a.worker_arg:
                 wargv += shlex.split(extra)
             sup.workers.append(sup.spawn(wid, wargv))
-        sup.record_session(url=url, host=a.host, port=a.port, mode="mock" if a.mock else a.model)
+        sup.record_session(url=url, host=a.host, port=a.port, mode="mock" if a.mock else a.model, **session_extra)
 
         ids = {wid for wid, _ in worker_specs(a.workers)}
         headers = {"Authorization": f"Bearer {client_token}"}
-        _wait(lambda: ids <= {w["worker_id"] for w in httpx.get(f"{url}/v1/grid/status", headers=headers,
-                                                                   timeout=2).json().get("workers", [])},
+        _wait(lambda: ids <= {w["worker_id"] for w in httpx.get(f"{url}/v1/grid/status", headers=headers, timeout=2,
+                                                                   verify=client_verify(url)).json().get("workers", [])},
               a.ready_timeout, f"{a.workers} worker registration(s)", sup)
 
         sd = "" if state.path == DEFAULT_STATE_DIR.resolve() else f" --state-dir {_display(state.path)}"
@@ -480,8 +517,16 @@ def cmd_down(a: argparse.Namespace) -> int:
 def _client(a: argparse.Namespace):
     import httpx
 
+    from grid_tls import TLSConfigError, client_verify
+
     url, token = resolve_endpoint(StateDir(a.state_dir), a.coordinator, a.token_file)
-    return url, token, httpx.Client(base_url=url, timeout=10,
+    try:
+        verify = client_verify(url)
+    except TLSConfigError as e:
+        raise CliError(str(e))
+    except OSError as e:
+        raise CliError(f"no coordinator reachable at {url} ({type(e).__name__}). Start one with `python nightshift.py up`.")
+    return url, token, httpx.Client(base_url=url, timeout=10, verify=verify,
                                     headers={"Authorization": f"Bearer {token}"} if token else {})
 
 
@@ -611,9 +656,10 @@ def cmd_token(a: argparse.Namespace) -> int:
         return 0
     for r, t in tokens.items():
         print(f"{r:<7} {t}    ({state.token_path(r)})")
-    url = (state.read_session() or {}).get("url", f"http://<coordinator-host>:{DEFAULT_PORT}")
-    print(f"\nJoin a remote worker (coordinator must be started with --host 0.0.0.0):\n"
-          f"  GRID_WORKER_TOKEN=$(cat worker.token) python worker_daemon.py --id node-x --coordinator {url}")
+    print(f"\nJoin a remote worker (coordinator started with --host 0.0.0.0, which serves TLS):\n"
+          f"  python grid_auth.py issue --id node-x --worker-token-file {state.token_path('worker')} --out node-x.credential\n"
+          f"  # copy node-x.credential to the worker machine, then on it:\n"
+          f"  python worker_daemon.py --token-file node-x.credential --discover")
     return 0
 
 

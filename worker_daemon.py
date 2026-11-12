@@ -48,7 +48,9 @@ import httpx
 import psutil
 
 from graphrag import EXTRACTION_SCHEMA, SYSTEM_PROMPT, ExtractionError, normalize_extraction
-from grid_auth import TOKEN_FILE_ENV, WORKER_TOKEN_ENV, GridAuthError, bearer_headers, check_auth, resolve_token
+from grid_auth import (TOKEN_FILE_ENV, WORKER_TOKEN_ENV, GridAuthError, bearer_headers, check_auth,
+                       credential_worker_id, resolve_token)
+from grid_tls import CA_FILE_ENV, FINGERPRINT_ENV, TLSConfigError, client_verify, normalize_fingerprint
 from idle_detection import (
     DEFAULT_MAX_HOST_CPU_PCT, DEFAULT_MIN_FREE_RAM_GB, ActivityMonitor, ActivitySample, IdleSensorUnavailable,
     build_guard_sources,
@@ -88,7 +90,17 @@ class CancelReason:
 
 class PreemptibleEdgeWorker:
     def __init__(self, args: argparse.Namespace):
+        self.token, self.token_source = resolve_token(args.token_file, WORKER_TOKEN_ENV)
+        cred_id = credential_worker_id(self.token)  # a per-worker credential names the one id it is valid for
+        if args.id is None:
+            if cred_id is None:
+                raise GridAuthError("--id is required (or use a per-worker credential, which carries its id)")
+            args.id = cred_id
+        elif cred_id is not None and cred_id != args.id:
+            raise GridAuthError(f"--id {args.id!r} does not match the worker credential, which is for {cred_id!r}")
         self.worker_id: str = args.id
+        self.ca_file: Optional[str] = args.ca_file
+        self.tls_fingerprint: Optional[str] = args.tls_fingerprint
         self.coordinator_url = (args.coordinator or DEFAULT_COORDINATOR).rstrip("/")
         self.ollama_url = args.ollama.rstrip("/")
         self.model: str = args.model
@@ -113,7 +125,6 @@ class PreemptibleEdgeWorker:
                 min_free_ram_gb=args.min_free_ram_gb, model_bytes=self.model_reload_bytes, log=guard_log),
             log=guard_log,
         )
-        self.token, self.token_source = resolve_token(args.token_file, WORKER_TOKEN_ENV)
         self.fatal: Optional[str] = None  # set on unrecoverable errors (bad credentials) -> exit non-zero
         self.heartbeat_interval = 3.0
         self.supports_thinking = False
@@ -472,9 +483,26 @@ class PreemptibleEdgeWorker:
                 self.log("x", f"unexpected error on chunk #{task.get('chunk_index')}: {type(e).__name__}: {e}")
                 await asyncio.sleep(1.0)
 
+    async def tls_verify(self):
+        """Authenticate the coordinator's certificate *before* the first request carries our token.
+        With a pinned fingerprint that needs the server up, so wait for it like register() does."""
+        delay = 0.5
+        while True:
+            try:
+                return await asyncio.to_thread(client_verify, self.coordinator_url, self.ca_file, self.tls_fingerprint)
+            except TLSConfigError as e:
+                self.fatal = str(e)
+                self.log("x", f"FATAL: {e}")
+                raise GridAuthError(str(e)) from e
+            except OSError as e:
+                self.log("~", f"coordinator unreachable for TLS check ({type(e).__name__}); retrying in {delay:.1f}s")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 10.0)
+
     async def run(self) -> None:
+        verify = await self.tls_verify()
         async with httpx.AsyncClient(base_url=self.coordinator_url, timeout=5.0, headers=bearer_headers(self.token),
-                                     event_hooks={"response": [self._check_coordinator_auth]}) as coord, \
+                                     verify=verify, event_hooks={"response": [self._check_coordinator_auth]}) as coord, \
                 httpx.AsyncClient(base_url=self.ollama_url, timeout=httpx.Timeout(120.0, connect=5.0)) as ollama:
             self.coord, self.ollama = coord, ollama
             if not self.mock:
@@ -531,7 +559,16 @@ async def resolve_coordinator(args: argparse.Namespace, token: Optional[str]) ->
                          f"Install them or pass --coordinator URL.")
     errors = (getattr(discovery, "DiscoveryError", RuntimeError), OSError)
     try:
-        url = await asyncio.to_thread(discovery.discover_coordinator, token, timeout=3.0)
+        found = await asyncio.to_thread(discovery.discover_coordinator_info, token, timeout=3.0,
+                                        **({"port": args.discovery_port} if args.discovery_port else {}))
+        url = found.url
+        fp = found.tls_fingerprint
+        if fp and url.startswith("https://"):
+            if args.tls_fingerprint and normalize_fingerprint(args.tls_fingerprint) != fp:
+                raise SystemExit(f"FATAL: discovered coordinator {url} presents TLS fingerprint {fp}, not the "
+                                 f"--tls-fingerprint you configured")
+            if not args.tls_fingerprint and not args.ca_file:
+                args.tls_fingerprint = fp  # authenticated by the discovery HMAC (when we hold a token)
     except errors as e:
         raise SystemExit(f"FATAL: --discover found no coordinator on the LAN ({e}). Check that the coordinator "
                          f"is running on this subnet and that multicast/UDP is not blocked, or pass --coordinator URL.")
@@ -547,6 +584,7 @@ async def _amain(args: argparse.Namespace) -> None:
         raise SystemExit(f"FATAL: {e}")
     if args.discover:
         worker.coordinator_url = (await resolve_coordinator(args, worker.token)).rstrip("/")
+        worker.tls_fingerprint = args.tls_fingerprint
         if not args.coordinator:
             worker.log("*", f"discovered coordinator at {worker.coordinator_url}")
     main = asyncio.create_task(worker.run())
@@ -612,10 +650,13 @@ def _resolve_cpu_threshold(a: argparse.Namespace) -> None:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # allow_abbrev=False: otherwise `--token SECRET` would silently parse as `--token-file SECRET`.
     p = argparse.ArgumentParser(description="Preemptible Edge AI Worker Daemon", allow_abbrev=False)
-    p.add_argument("--id", required=True, help="Unique worker ID (e.g. node-office-pc)")
+    p.add_argument("--id", default=None,
+                   help="Unique worker ID (e.g. node-office-pc); optional with a per-worker credential, which names it")
     p.add_argument("--coordinator", default=None, metavar="URL", help=f"Coordinator base URL (default {DEFAULT_COORDINATOR})")
     p.add_argument("--discover", action="store_true",
                    help="Find the coordinator on the LAN at startup (ignored if --coordinator is given)")
+    p.add_argument("--discovery-port", type=int, default=None, metavar="PORT",
+                   help="UDP port for --discover (default 47474; must match the coordinator's)")
     p.add_argument("--ollama", default="http://127.0.0.1:11434")
     p.add_argument("--model", default=os.environ.get("GRID_MODEL", "qwen2.5:3b"))
     p.add_argument("--tier", type=int, choices=(1, 2, 3), default=None, help="Override capability tier")
@@ -645,6 +686,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         f"reload the model with 1 GB to spare (default {DEFAULT_MIN_FREE_RAM_GB:g}; 0 disables)")
     p.add_argument("--token-file", default=None, metavar="PATH",
                    help=f"Coordinator worker token file (else ${TOKEN_FILE_ENV} / env {' / '.join(WORKER_TOKEN_ENV)})")
+    p.add_argument("--tls-fingerprint", default=os.environ.get(FINGERPRINT_ENV) or None, metavar="SHA256",
+                   help=f"Pin the coordinator's TLS certificate (sha256:<hex>, printed by the coordinator; "
+                        f"--discover fills it in) [env {FINGERPRINT_ENV}]")
+    p.add_argument("--ca-file", default=os.environ.get(CA_FILE_ENV) or None, metavar="PEM",
+                   help=f"Verify the coordinator against this CA / certificate file [env {CA_FILE_ENV}]")
     p.add_argument("--unload-on-preempt", choices=("auto", "always", "never"), default="auto",
                    help="Send keep_alive=0 on preempt: auto = only under memory pressure (always on low_memory); "
                         "never = also not on low_memory")

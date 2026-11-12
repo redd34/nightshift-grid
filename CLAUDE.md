@@ -20,7 +20,7 @@ Instead of tensor-splitting a large model across slow LAN links, each node runs 
 - `idle_detection.py`: `ActivityMonitor` (trigger file + OS-native HID idle: macOS ioreg, Windows GetLastInputInfo, Linux xprintidle).
 - `graphrag.py`: extraction JSON schema, `normalize_extraction()`, idempotent `JsonlGraphSink` (`output_graph.jsonl`).
 - `chaos_test.py`: E2E chaos harness (preemption + SIGKILL phases, zero-loss verification) → `chaos_report*.json`.
-- `grid_store.py`: SQLite (WAL) journal for coordinator crash recovery; `grid_auth.py`: worker/client bearer-token resolution.
+- `grid_store.py`: SQLite (WAL) journal for coordinator crash recovery; `grid_auth.py`: worker/client bearer-token resolution + per-worker credentials (`python grid_auth.py issue`); `grid_tls.py`: self-signed cert (`--auto-tls`) + client fingerprint pinning / CA verification.
 - `ingest.py` (files → chunks → jobs + provenance manifest), `reduce_graph.py` (entity resolution, graph.json/GraphML, Qdrant sink, `query`).
 - `nightshift.py` (one-command CLI: up/down/submit/status/chaos-test/token), `mcp_server.py` (MCP tools for AI IDEs, see docs/MCP.md), `discovery.py` (HMAC-proven UDP LAN discovery), `qdrant_sink.py` (live Qdrant sink with disk spool).
 - `deploy/`: per-user worker service installers (launchd / systemd --user / Windows Task Scheduler), coordinator systemd unit, token generator.

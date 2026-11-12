@@ -56,7 +56,9 @@ from pydantic import BaseModel, Field
 
 from discovery import DISCOVERY_PORT, DiscoveryResponder, default_advertise_url
 from graphrag import ExtractionError, GraphSink, JsonlGraphSink, NullSink, normalize_extraction
-from grid_auth import CLIENT_TOKEN_ENV, WORKER_TOKEN_ENV, GridAuthError, resolve_token
+from grid_auth import (CLIENT_TOKEN_ENV, WORKER_TOKEN_ENV, GridAuthError, credential_worker_id, resolve_token,
+                       verify_worker_credential)
+from grid_tls import TLSConfigError, cert_sans, default_sans, ensure_self_signed, fingerprint_file
 from grid_store import GridStore
 
 LEASE_TTL_SECONDS = 12.0
@@ -675,6 +677,41 @@ def _bearer_guard(expected: Optional[str]):
     return guard
 
 
+def _worker_guard(master: Optional[str], allow_shared: bool):
+    """Authenticate /worker/* and pin the caller to an identity (`request.state.worker_identity`).
+
+    A per-worker credential (see grid_auth.derive_worker_credential) authorizes exactly one worker
+    id. The master worker token authorizes any id, and is accepted only when `allow_shared` (the
+    loopback default, where every process runs on one machine anyway)."""
+    async def guard(request: Request, authorization: Optional[str] = Header(default=None)) -> None:
+        request.state.worker_identity = None
+        if master is None:
+            return
+        scheme, _, token = (authorization or "").partition(" ")
+        token = token.strip()
+        if scheme.lower() == "bearer":
+            wid = verify_worker_credential(master, token)
+            if wid is not None:
+                request.state.worker_identity = wid
+                return
+            if hmac.compare_digest(token.encode(), master.encode()):
+                if allow_shared:
+                    return
+                raise HTTPException(status_code=401, headers={"WWW-Authenticate": "Bearer"},
+                                    detail="this coordinator requires per-worker credentials; the shared worker token "
+                                           "is not accepted from workers (issue one with `python grid_auth.py issue "
+                                           "--id <worker-id> --out <file>` on the coordinator host)")
+        raise HTTPException(status_code=401, detail="missing or invalid bearer token",
+                            headers={"WWW-Authenticate": "Bearer"})
+    return guard
+
+
+def _check_identity(request: Request, worker_id: str) -> None:
+    identity = getattr(request.state, "worker_identity", None)
+    if identity is not None and identity != worker_id:
+        raise HTTPException(status_code=403, detail=f"credential is for worker {identity!r}, not {worker_id!r}")
+
+
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
@@ -691,8 +728,10 @@ def _hostname(value: str) -> str:
 
 def create_app(state: GridState | None = None, worker_token: str | None = None,
                client_token: str | None = None, discovery: DiscoveryResponder | None = None,
-               trusted_hosts: frozenset[str] | set[str] | None = None) -> FastAPI:
-    """`trusted_hosts`: hostnames accepted in Host/Origin headers (loopback names are always allowed)."""
+               trusted_hosts: frozenset[str] | set[str] | None = None,
+               allow_shared_worker_token: bool = True) -> FastAPI:
+    """`trusted_hosts`: hostnames accepted in Host/Origin headers (loopback names are always allowed).
+    `allow_shared_worker_token=False` makes workers authenticate with per-worker credentials only."""
     grid = state or GridState(sink=_sink_from_env())
     allowed_hosts = LOOPBACK_HOSTS | {h.lower() for h in (trusted_hosts or ())}
     auth_enabled = bool(worker_token or client_token)
@@ -742,14 +781,15 @@ def create_app(state: GridState | None = None, worker_token: str | None = None,
         if not auth_enabled and _hostname(request.headers.get("host", "")) not in allowed_hosts:
             return JSONResponse({"detail": "untrusted Host header (DNS rebinding protection)"}, status_code=403)
         return await call_next(request)
-    worker_api = APIRouter(prefix="/worker", dependencies=[Depends(_bearer_guard(worker_token))])
+    worker_api = APIRouter(prefix="/worker", dependencies=[Depends(_worker_guard(worker_token, allow_shared_worker_token))])
     client_api = APIRouter(prefix="/v1", dependencies=[Depends(_bearer_guard(client_token))])
 
     def _unknown(worker_id: str):
         # 404 tells the worker to re-register (unknown id, or a session that isn't the current one).
         return HTTPException(status_code=404, detail=f"worker {worker_id} not registered (or stale session)")
 
-    def _session(worker_id: str, session: Optional[str]) -> None:
+    def _session(request: Request, worker_id: str, session: Optional[str]) -> None:
+        _check_identity(request, worker_id)
         try:
             grid.verify_session(worker_id, session)
         except KeyError:
@@ -760,7 +800,9 @@ def create_app(state: GridState | None = None, worker_token: str | None = None,
         return {"ok": True}  # deliberately unauthenticated and information-free
 
     @worker_api.post("/register")
-    async def register_worker(info: WorkerInfo, x_nightshift_session: Optional[str] = Header(default=None)):
+    async def register_worker(request: Request, info: WorkerInfo,
+                              x_nightshift_session: Optional[str] = Header(default=None)):
+        _check_identity(request, info.worker_id)
         try:
             session = grid.register(info, session=x_nightshift_session)
         except WorkerIdInUse:
@@ -770,8 +812,8 @@ def create_app(state: GridState | None = None, worker_token: str | None = None,
                 "heartbeat_interval": HEARTBEAT_INTERVAL_SECONDS}
 
     @worker_api.post("/pull-task")
-    async def pull_task(worker_id: str, x_nightshift_session: Optional[str] = Header(default=None)):
-        _session(worker_id, x_nightshift_session)
+    async def pull_task(request: Request, worker_id: str, x_nightshift_session: Optional[str] = Header(default=None)):
+        _session(request, worker_id, x_nightshift_session)
         try:
             task = grid.pull(worker_id)
         except KeyError:
@@ -782,32 +824,32 @@ def create_app(state: GridState | None = None, worker_token: str | None = None,
                          "chunk_index": task.chunk_index, "prompt": task.prompt, "lease_ttl": grid.lease_ttl}}
 
     @worker_api.post("/heartbeat")
-    async def worker_heartbeat(hb: HeartbeatRequest, x_nightshift_session: Optional[str] = Header(default=None)):
-        _session(hb.worker_id, x_nightshift_session)
+    async def worker_heartbeat(request: Request, hb: HeartbeatRequest, x_nightshift_session: Optional[str] = Header(default=None)):
+        _session(request, hb.worker_id, x_nightshift_session)
         try:
             return grid.heartbeat(hb)
         except KeyError:
             raise _unknown(hb.worker_id)
 
     @worker_api.post("/preempt")
-    async def preempt_worker(req: PreemptRequest, x_nightshift_session: Optional[str] = Header(default=None)):
-        _session(req.worker_id, x_nightshift_session)
+    async def preempt_worker(request: Request, req: PreemptRequest, x_nightshift_session: Optional[str] = Header(default=None)):
+        _session(request, req.worker_id, x_nightshift_session)
         try:
             return {"reclaimed": grid.preempt(req)}
         except KeyError:
             raise _unknown(req.worker_id)
 
     @worker_api.post("/complete")
-    async def complete_task(req: TaskCompleteRequest, x_nightshift_session: Optional[str] = Header(default=None)):
-        _session(req.worker_id, x_nightshift_session)
+    async def complete_task(request: Request, req: TaskCompleteRequest, x_nightshift_session: Optional[str] = Header(default=None)):
+        _session(request, req.worker_id, x_nightshift_session)
         try:
             return grid.complete(req)
         except LeaseError as e:
             raise HTTPException(status_code=409, detail=str(e))
 
     @worker_api.post("/fail")
-    async def fail_task(req: TaskFailRequest, x_nightshift_session: Optional[str] = Header(default=None)):
-        _session(req.worker_id, x_nightshift_session)
+    async def fail_task(request: Request, req: TaskFailRequest, x_nightshift_session: Optional[str] = Header(default=None)):
+        _session(request, req.worker_id, x_nightshift_session)
         try:
             grid.fail(req)
             return {"status": "requeued"}
@@ -903,8 +945,9 @@ def ensure_auto_tokens(token_dir: str | os.PathLike, worker_token: str | None, c
         if sources[role].startswith("auto"):
             print(f"[coordinator] {role} token: {sources[role]}", file=stderr)
     if minted:
-        hint = (f"copy {d / AUTO_TOKEN_FILES['worker']} to each worker host (chmod 600) and run "
-                f"`worker_daemon.py --token-file <it>`")
+        hint = (f"keep {d / AUTO_TOKEN_FILES['worker']} on this host (it is the master worker secret) and give each "
+                f"worker its own credential: `python grid_auth.py issue --id <worker-id> --worker-token-file "
+                f"{d / AUTO_TOKEN_FILES['worker']} --out <worker-id>.credential`")
         print(f"[coordinator] generated {', '.join(minted)} token(s); {hint}", file=stderr)
         if getattr(stdout, "isatty", lambda: False)():
             for role, tok in minted.items():
@@ -986,14 +1029,31 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--client-token-file", help="file with the client bearer token (else $GRID_CLIENT_TOKEN / $GRID_TOKEN)")
     p.add_argument("--auto-token", action="store_true",
                    help="generate any missing worker/client token into 0600 files next to --db and reuse them later")
-    p.add_argument("--allow-insecure", action="store_true", help="allow a non-loopback bind without tokens (not recommended)")
+    p.add_argument("--allow-insecure", action="store_true",
+                   help="allow a non-loopback bind without tokens or TLS (not recommended)")
+    p.add_argument("--worker-auth", choices=("auto", "per-worker", "shared"), default="auto",
+                   help="per-worker = workers must present a credential bound to their id (grid_auth.py issue); "
+                        "shared = the master worker token is also accepted. auto = per-worker on a non-loopback "
+                        "bind, shared on loopback")
     p.add_argument("--trusted-host", action="append", default=[], metavar="NAME",
                    help="extra hostname accepted in Host/Origin headers (repeatable; loopback names always allowed)")
+    t = p.add_argument_group("TLS (required for a non-loopback bind unless --allow-plaintext)")
+    t.add_argument("--tls-cert", default=None, help="PEM certificate (chain) file")
+    t.add_argument("--tls-key", default=None, help="PEM private key file (mode 0600)")
+    t.add_argument("--auto-tls", action="store_true",
+                   help="use (minting on first run) a self-signed certificate next to --db; workers pin its "
+                        "fingerprint, which discovery delivers authenticated")
+    t.add_argument("--tls-san", action="append", default=[], metavar="NAME",
+                   help="extra DNS name / IP for a newly minted --auto-tls certificate (repeatable)")
+    t.add_argument("--allow-plaintext", action="store_true",
+                   help="serve plain HTTP on a non-loopback bind (only if the network is already encrypted, "
+                        "e.g. Tailscale/WireGuard)")
     g = p.add_argument_group("LAN discovery")
     g.add_argument("--advertise", action=argparse.BooleanOptionalAction, default=None,
                    help="answer UDP discovery probes (default: on for a non-loopback --host, off on loopback)")
     g.add_argument("--discovery-port", type=int, default=DISCOVERY_PORT)
-    g.add_argument("--advertise-url", default=None, help="URL workers should use (default http://<primary LAN IP>:<port>)")
+    g.add_argument("--advertise-url", default=None,
+                   help="URL workers should use (default http(s)://<primary LAN IP>:<port>)")
     q = p.add_argument_group("live Qdrant sink (optional; JSONL stays the system of record)")
     qm = q.add_mutually_exclusive_group()
     qm.add_argument("--qdrant-url", default=None, help="e.g. http://localhost:6333 (or a local path)")
@@ -1020,6 +1080,50 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(f"Refusing to bind {a.host} without worker AND client tokens (anyone on the network could "
                          f"submit jobs or forge results). Pass --auto-token to generate them (saved next to the db), "
                          f"set GRID_TOKEN, or pass --allow-insecure.")
+    if credential_worker_id(worker_token):
+        raise SystemExit("the configured worker token is a per-worker credential; the coordinator needs the master "
+                         "worker token it was derived from")
+
+    # ---- TLS
+    if bool(a.tls_cert) != bool(a.tls_key):
+        raise SystemExit("--tls-cert and --tls-key must be given together")
+    if a.auto_tls and a.tls_cert:
+        raise SystemExit("--auto-tls and --tls-cert/--tls-key are mutually exclusive")
+    cert = key = tls_fp = None
+    try:
+        if a.auto_tls:
+            extra = list(a.tls_san) + ([_hostname(a.advertise_url)] if a.advertise_url else []) + \
+                ([a.host] if a.host not in ("0.0.0.0", "::") else [])
+            cert, key, tls_fp, created = ensure_self_signed(_state_dir(a.db), default_sans(extra))
+            print(f"[coordinator] TLS: {'minted' if created else 'reusing'} self-signed certificate {cert}",
+                  file=sys.stderr)
+            missing = [n for n in extra if n and n not in cert_sans(cert)]
+            if missing and not created:
+                print(f"[coordinator] note: certificate has no SAN for {', '.join(missing)}; fingerprint-pinning "
+                      f"clients are unaffected, CA-file clients need a new cert (delete {cert} and {key})",
+                      file=sys.stderr)
+        elif a.tls_cert:
+            cert, key = Path(a.tls_cert), Path(a.tls_key)
+            tls_fp = fingerprint_file(cert)
+            if os.name == "posix" and os.stat(key).st_mode & 0o077:
+                print(f"[coordinator] WARNING: TLS key {key} is readable by other users; chmod 600 it", file=sys.stderr)
+    except (TLSConfigError, OSError, ValueError) as e:
+        raise SystemExit(f"TLS setup failed: {e}")
+    if not _is_loopback(a.host) and cert is None and not (a.allow_plaintext or a.allow_insecure):
+        raise SystemExit(f"Refusing to serve plain HTTP on {a.host}: bearer tokens and results would cross the network "
+                         f"unencrypted. Pass --auto-tls (self-signed; workers pin the fingerprint, which --discover "
+                         f"delivers automatically), --tls-cert/--tls-key, or --allow-plaintext if the network is "
+                         f"already encrypted (Tailscale/WireGuard).")
+    if tls_fp:
+        print(f"[coordinator] TLS fingerprint: {tls_fp}  (workers: --tls-fingerprint {tls_fp})", file=sys.stderr)
+    scheme = "https" if cert else "http"
+
+    # ---- worker identity
+    per_worker = {"per-worker": True, "shared": False, "auto": not _is_loopback(a.host)}[a.worker_auth]
+    if per_worker and worker_token:
+        print("[coordinator] workers must use per-worker credentials: "
+              "python grid_auth.py issue --id <worker-id> --worker-token-file <master> --out <file>", file=sys.stderr)
+
     if not (worker_token or client_token):
         print("[coordinator] WARNING: auth disabled (no tokens configured)", file=sys.stderr)
     elif worker_token == client_token:
@@ -1031,12 +1135,15 @@ def main(argv: list[str] | None = None) -> None:
     advertise = (not _is_loopback(a.host)) if a.advertise is None else a.advertise
     responder = None
     if advertise:
-        url = a.advertise_url or default_advertise_url(a.host, a.port)
+        url = a.advertise_url or default_advertise_url(a.host, a.port, scheme)
+        if cert and not url.startswith("https://"):
+            raise SystemExit(f"--advertise-url {url} must be https:// when TLS is enabled")
         # On a loopback bind, also keep the UDP responder on loopback: never advertise to the LAN
         # a URL that only works on this machine.
         bind = "127.0.0.1" if _is_loopback(a.host) else ""
         try:
-            responder = DiscoveryResponder(url, worker_token, bind_host=bind, port=a.discovery_port)
+            responder = DiscoveryResponder(url, worker_token, bind_host=bind, port=a.discovery_port,
+                                           tls_fingerprint=tls_fp)
         except ValueError as e:
             raise SystemExit(str(e))
         if not worker_token:
@@ -1052,9 +1159,10 @@ def main(argv: list[str] | None = None) -> None:
         trusted.add(a.host)
     if responder is not None:
         trusted.add(_hostname(responder.advertise_url))
+    tls_kwargs = {"ssl_certfile": str(cert), "ssl_keyfile": str(key)} if cert else {}
     uvicorn.run(create_app(grid, worker_token=worker_token, client_token=client_token, discovery=responder,
-                           trusted_hosts=trusted),
-                host=a.host, port=a.port, log_level="warning")
+                           trusted_hosts=trusted, allow_shared_worker_token=not per_worker),
+                host=a.host, port=a.port, log_level="warning", **tls_kwargs)
 
 
 if __name__ == "__main__":

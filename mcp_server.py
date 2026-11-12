@@ -52,6 +52,7 @@ import ingest
 import reduce_graph as rg
 from coordinator import MAX_CHUNK_CHARS, MAX_CHUNKS_PER_JOB
 from grid_auth import CLIENT_TOKEN_ENV, GridAuthError, bearer_headers, check_auth, resolve_token
+from grid_tls import TLSConfigError, client_verify
 
 DEFAULT_URL = "http://127.0.0.1:8000"
 # grid_auth may or may not list NIGHTSHIFT_TOKEN yet; dict.fromkeys keeps its order and dedupes.
@@ -339,7 +340,14 @@ class GridClient:
     async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         url = self.cfg.coordinator_url
         try:
-            async with httpx.AsyncClient(base_url=url, transport=self.transport, timeout=HTTP_TIMEOUT) as client:
+            verify = True if self.transport is not None else await asyncio.to_thread(client_verify, url)
+        except TLSConfigError as e:
+            raise ToolError(f"TLS check of the coordinator at {url} failed: {e}") from None
+        except OSError:
+            raise ToolError(f"Cannot reach the Nightshift coordinator at {url}.") from None
+        try:
+            async with httpx.AsyncClient(base_url=url, transport=self.transport, timeout=HTTP_TIMEOUT,
+                                         verify=verify) as client:
                 r = await client.request(method, path, headers=self._headers(), **kwargs)
         except httpx.ConnectError:
             raise ToolError(f"Cannot reach the Nightshift coordinator at {url}. Start it "

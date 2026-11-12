@@ -208,15 +208,18 @@ Useful worker flags:
 - `--allow-battery`, `--min-battery-percent P`, `--ignore-thermal` and `--max-temp-c C` control the power and thermal guards.
 - `--max-host-cpu-pct P` (default 65, 0 = off) and `--cpu-busy-samples N` control the CPU guard. `--min-free-ram-gb G` (default 2.0) controls the RAM guard.
 - `--allow-no-idle-sensor` keeps the worker running when no HID idle sensor is available.
-- `--discover` finds the coordinator on the LAN.
-- `--token-file PATH` sets the worker token. Otherwise it comes from `$GRID_WORKER_TOKEN`, `$GRID_TOKEN`, `$NIGHTSHIFT_TOKEN_FILE` or `$NIGHTSHIFT_TOKEN`.
+- `--discover` (with `--discovery-port`) finds the coordinator on the LAN, and learns its TLS fingerprint through the authenticated reply.
+- `--token-file PATH` sets the worker credential. Otherwise it comes from `$GRID_WORKER_TOKEN`, `$GRID_TOKEN`, `$NIGHTSHIFT_TOKEN_FILE` or `$NIGHTSHIFT_TOKEN`. With a per-worker credential, `--id` is optional, because the credential names its id.
+- `--tls-fingerprint sha256:…` pins the coordinator's certificate. `--ca-file PEM` verifies it against a CA instead. The env equivalents are `$NIGHTSHIFT_TLS_FINGERPRINT` and `$NIGHTSHIFT_CA_FILE`, which the dashboard, `demo_submit.py`, the CLI and the MCP server also read.
 
 Coordinator flags:
 - `--host` defaults to `127.0.0.1`.
 - `--db grid_state.db` sets the state file (`none` = in-memory).
 - `--output` sets the JSONL sink.
 - `--worker-token-file` and `--client-token-file` set the tokens. Otherwise they come from `$GRID_WORKER_TOKEN`/`$GRID_CLIENT_TOKEN`, or `$GRID_TOKEN` for both.
-- `--allow-insecure` permits a LAN bind without tokens.
+- `--auto-tls` serves HTTPS with a self-signed certificate. It's minted on the first run next to the db and reused afterwards, and its fingerprint is printed at startup. Alternatively, use `--tls-cert` / `--tls-key`. A non-loopback bind refuses plain HTTP unless you pass `--allow-plaintext`, which is for networks that are already encrypted, such as Tailscale/WireGuard.
+- `--worker-auth auto|per-worker|shared` sets how workers authenticate. The default, `auto`, means `per-worker` on a LAN bind: each worker presents a credential bound to its own id, minted with `python grid_auth.py issue --id node-x --worker-token-file worker.token --out node-x.credential`. The master worker token then never leaves the coordinator host.
+- `--allow-insecure` permits a LAN bind without tokens or TLS.
 - `--auto-token` generates and persists 0600 tokens on the first run.
 - `--advertise` / `--no-advertise` and `--discovery-port` control LAN discovery. It's on by default for non-loopback binds.
 - `--qdrant-url URL` or `--qdrant-memory`, plus `--qdrant-collection nightshift_graph` and `--qdrant-embedder auto|ollama|hash`, enable the live vector sink. `python qdrant_sink.py backfill` re-indexes from the JSONL.
@@ -225,7 +228,7 @@ Coordinator flags:
 
 ## API
 
-With tokens configured, `/worker/*` requires `Authorization: Bearer <worker token>` and `/v1/*` requires the client token.
+With tokens configured, `/worker/*` requires `Authorization: Bearer <worker credential>` and `/v1/*` requires the client token. A per-worker credential is `nsw1.<id>.<HMAC(master, id)>`. It only works for its own `worker_id`: using it for any other id gets a 403, and it can't mint new ids.
 
 | Endpoint | Purpose |
 |---|---|
@@ -262,7 +265,7 @@ With tokens configured, `/worker/*` requires `Authorization: Bearer <worker toke
 ## Known limitations and roadmap
 
 - **Single-host benchmarks so far.** All three workers shared one Mac and one Ollama. The next milestone is a multi-machine pilot. Latency metrics compare worker and coordinator wall clocks, which is exact on one host but subject to NTP skew across hosts.
-- **No TLS.** Bearer tokens travel in cleartext on the LAN. Put the coordinator behind a TLS reverse proxy (Caddy/nginx) or a WireGuard/Tailscale network for anything beyond a trusted subnet. Worker identity is session-bound: `/worker/register` returns a per-registration secret that every later worker call must present. A token holder therefore can't hijack a *live* worker's id or leases, though it can still register new ids and submit bad results.
+- **Transport and identity.** A LAN coordinator serves TLS (`--auto-tls` or your own certificate), and workers pin its fingerprint. Each worker holds a credential that's valid only for its own id, and every call is also bound to the current registration's session. What remains: a compromised worker can still submit bad results *for chunks it leases* (results aren't cross-checked yet), credentials are revoked only by rotating the master worker token, and the self-signed certificate's private key is only as safe as the coordinator host.
 - **Single coordinator.** It's durable, but not highly available. Finished jobs are never pruned, so the state DB grows with history.
 - **Mixed failure policy.** HID idle sensing fails closed. Battery, thermal, CPU and RAM sensors fail open with one warning each.
 - **Qdrant sink and SIGKILL.** Records still in the sink's in-memory queue when the coordinator is SIGKILLed (under a second's worth) are in the JSONL but not in Qdrant until `python qdrant_sink.py backfill` runs.
