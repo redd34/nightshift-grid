@@ -56,7 +56,7 @@ from pydantic import BaseModel, Field
 
 from discovery import DISCOVERY_PORT, DiscoveryResponder, default_advertise_url
 from graphrag import ExtractionError, GraphSink, JsonlGraphSink, NullSink, normalize_extraction
-from relay import MAX_CKPT_CHARS
+from relay import MAX_CKPT_CHARS, valid_checkpoint
 from grid_auth import (CLIENT_TOKEN_ENV, WORKER_TOKEN_ENV, GridAuthError, credential_worker_id, resolve_token,
                        verify_worker_credential)
 from grid_tls import TLSConfigError, cert_sans, default_sans, ensure_self_signed, fingerprint_file
@@ -177,7 +177,7 @@ class CheckpointFields(BaseModel):
     """Baton: the holder's progress. `gen_tokens` is cumulative for this generation (a resumed
     lease starts at the tokens it was handed). The text travels as a delta: `ckpt_delta` replaces
     the stored checkpoint from character `ckpt_from` on, so each heartbeat only carries new text."""
-    gen_tokens: int = Field(0, ge=0)
+    gen_tokens: int = Field(0, ge=0, le=1_000_000)
     ckpt_from: Optional[int] = Field(None, ge=0)
     ckpt_delta: Optional[str] = Field(None, max_length=MAX_CKPT_CHARS)
 
@@ -205,7 +205,7 @@ class TaskCompleteRequest(BaseModel):
     lease_id: str
     result: dict
     tokens_per_sec: float = 0.0
-    gen_tokens: int = Field(0, ge=0)
+    gen_tokens: int = Field(0, ge=0, le=1_000_000)
 
 
 class TaskFailRequest(BaseModel):
@@ -411,8 +411,11 @@ class GridState:
             return False  # nothing new (already acknowledged)
         if len(text) > MAX_CKPT_CHARS or len(text) < len(task.ckpt_text):
             return False  # only progress replaces a checkpoint (a rolled-back resume catches up first)
+        if not valid_checkpoint(text):
+            return False  # untrusted input to another worker's prompt: JSON prefix only, no template tokens
         w = self.workers.get(task.assigned_worker or "")
-        task.ckpt_text, task.ckpt_tokens = text, max(cp.gen_tokens, task.lease_start_tokens)
+        # A token is at least one character of text, so a checkpoint can't claim more tokens than chars.
+        task.ckpt_text, task.ckpt_tokens = text, min(len(text), max(cp.gen_tokens, task.lease_start_tokens))
         task.ckpt_model = w.model_name if w else ""
         self._dirty_tasks.add(task.task_id)
         return True
@@ -666,7 +669,16 @@ class GridState:
         self._fail(self._get_lease(req.worker_id, req.task_id, req.lease_id), req.worker_id, req.error)
 
     def _fail(self, task: GridTask, worker_id: str, error: str) -> None:
+        resumed = task.lease_start_tokens > 0
         self._drop_checkpoint(task)
+        if resumed:
+            # The prefix (written by another worker) is the likely culprit, not this worker or the chunk:
+            # retry from scratch without spending the chunk's failure budget. Bounded: the checkpoint is
+            # gone, so the next attempt is a fresh one.
+            self.log("RELAY_DISCARDED", f"Chunk #{task.chunk_index}: resumed attempt on {worker_id} failed "
+                     f"({error[:80]}); checkpoint dropped, restarting from token 0", task, worker_id)
+            self._requeue(task)
+            return
         w = self.workers.get(worker_id)
         if w:
             w.failed_count += 1

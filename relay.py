@@ -29,6 +29,20 @@ from typing import Awaitable, Callable, Optional
 MAX_CKPT_CHARS = 64_000      # coordinator-side cap on a stored checkpoint
 MAX_RESUME_TOKENS = 1024     # cap on any continuation: a runaway resume must never hog a node
 MAX_ITEMS = 48               # cap on grammar-resumed array items
+# Chat-template control sequences. A checkpoint is untrusted input to the *next* worker's raw prompt,
+# so text containing any of these is never stored or rendered (it could otherwise close the assistant
+# turn and inject a system/user message into another node's model).
+TEMPLATE_MARKERS = ("<|", "|>", "<think", "</think", "<s>", "</s>", "[INST]", "<start_of_turn>", "<end_of_turn>")
+
+
+def safe_for_raw_prompt(text: str) -> bool:
+    return not any(m in text for m in TEMPLATE_MARKERS)
+
+
+def valid_checkpoint(text: str) -> bool:
+    """What a coordinator accepts as a relay checkpoint: an extraction-JSON prefix (per the online
+    validator) with no chat-template control sequences."""
+    return text.lstrip().startswith("{") and safe_for_raw_prompt(text) and closable(text) is not None
 
 
 # --------------------------------------------------------------------------- JSON progress

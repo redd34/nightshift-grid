@@ -49,7 +49,8 @@ import httpx
 import psutil
 
 from graphrag import EXTRACTION_SCHEMA, SYSTEM_PROMPT, ExtractionError, normalize_extraction
-from relay import MAX_RESUME_TOKENS, ChatML, closable, first_json, json_done, scan_checkpoint, structured_resume
+from relay import (MAX_RESUME_TOKENS, ChatML, closable, first_json, json_done, safe_for_raw_prompt, scan_checkpoint,
+                   structured_resume)
 from grid_auth import (TOKEN_FILE_ENV, WORKER_TOKEN_ENV, GridAuthError, bearer_headers, check_auth,
                        credential_worker_id, resolve_token)
 from grid_tls import CA_FILE_ENV, FINGERPRINT_ENV, TLSConfigError, client_verify, normalize_fingerprint
@@ -561,6 +562,11 @@ class PreemptibleEdgeWorker:
     async def work_one(self, task: dict) -> None:
         self.task_id, self.lease_id, self.cancel_reason = task["task_id"], task["lease_id"], None
         self.resume = task.get("resume") if self.can_resume else None
+        if self.resume and not self.mock and not (safe_for_raw_prompt(self.resume.get("text", ""))
+                                                  and safe_for_raw_prompt(task["prompt"])):
+            self.log("!", f"chunk #{task['chunk_index']}: refusing resume (chat-template tokens in prefix or chunk); "
+                          f"starting from token 0")
+            self.resume = None
         self.gen_lease, self.ckpt_epoch = self.lease_id, self.ckpt_epoch + 1
         self.gen_pieces = [self.resume["text"]] if self.resume else []
         self.gen_tokens = self.resume["tokens"] if self.resume else 0
