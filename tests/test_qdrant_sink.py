@@ -285,8 +285,8 @@ def test_lifespan_closes_sink_and_status_exposes_stats(client, tmp_path):
 
     q = make(client, tmp_path)
     grid = GridState(sink=FanoutSink(JsonlGraphSink(tmp_path / "o.jsonl"), q))
-    with TestClient(create_app(grid)) as c:
-        c.post("/worker/register", json={"worker_id": "w"})
+    with TestClient(create_app(grid), base_url="http://127.0.0.1") as c:
+        c.headers["X-Nightshift-Session"] = c.post("/worker/register", json={"worker_id": "w"}).json()["session"]
         c.post("/v1/grid/mapreduce", json={"job_name": "j", "chunks": ["Alpha links Beta"]})
         t = c.post("/worker/pull-task", params={"worker_id": "w"}).json()["task"]
         assert c.post("/worker/complete", json={"worker_id": "w", "task_id": t["task_id"], "lease_id": t["lease_id"],

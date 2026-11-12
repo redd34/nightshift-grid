@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from coordinator import (BatchSubmitRequest, GridState, HeartbeatRequest, LeaseError, PreemptRequest, TaskCompleteRequest,
+from coordinator import (WorkerIdInUse, BatchSubmitRequest, GridState, HeartbeatRequest, LeaseError, PreemptRequest, TaskCompleteRequest,
                          TaskFailRequest, TaskState, WorkerInfo, WorkerState)
 from graphrag import JsonlGraphSink
 from grid_store import GridStore
@@ -119,10 +119,29 @@ def test_tier3_prefers_tier3_work(grid):
 
 def test_offline_detection_and_reregister_reclaims(grid, clock):
     submit(grid, 1); t = grid.pull("w1")
-    grid.register(WorkerInfo(worker_id="w1", tier=1))      # crashed & restarted
-    assert t.state == TaskState.PENDING and t.failures == 0
-    clock.advance(13); grid.reap()
+    with pytest.raises(WorkerIdInUse):                     # another process can't take a live worker's id
+        grid.register(WorkerInfo(worker_id="w1", tier=1))
+    assert t.state == TaskState.LEASED
+    clock.advance(13); grid.reap()                         # the crashed worker times out...
     assert all(w.state == WorkerState.OFFLINE for w in grid.workers.values())
+    session = grid.register(WorkerInfo(worker_id="w1", tier=1))   # ...then its restart may register
+    assert session and grid.verify_session("w1", session)
+    with pytest.raises(KeyError):
+        grid.verify_session("w1", "forged")
+
+
+def test_reregister_with_own_session_and_graceful_shutdown_frees_id(grid):
+    s1 = grid.register(WorkerInfo(worker_id="w9", tier=1))
+    s2 = grid.register(WorkerInfo(worker_id="w9", tier=1), session=s1)   # same live worker re-registering
+    with pytest.raises(KeyError):
+        grid.verify_session("w9", s1)                                    # old session is revoked
+    grid.preempt(PreemptRequest(worker_id="w9", reason="shutdown"))
+    assert grid.workers["w9"].state == WorkerState.OFFLINE
+    assert grid.register(WorkerInfo(worker_id="w9", tier=1)) != s2      # restart registers immediately
+
+
+def test_status_never_exposes_session_digest(grid):
+    assert all("session_digest" not in w for w in grid.status()["workers"])
 
 
 

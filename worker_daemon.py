@@ -160,9 +160,21 @@ class PreemptibleEdgeWorker:
         delay = 0.5
         while True:
             try:
+                # The client already carries our current session header (if any), so re-registering
+                # our own still-live id succeeds; a different process using this id gets 409.
                 r = await self.coord.post("/worker/register", json=payload)
+                if r.status_code == 409:
+                    self.log("~", f"worker id {self.worker_id} is still held by a live worker (a previous run "
+                                  f"that hasn't timed out yet?); retrying in {delay:.1f}s")
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 10.0)
+                    continue
                 r.raise_for_status()
-                self.heartbeat_interval = body(r).get("heartbeat_interval", 3.0)
+                reply = body(r)
+                self.heartbeat_interval = reply.get("heartbeat_interval", 3.0)
+                if reply.get("session"):
+                    # Binds every later call to this registration; never logged.
+                    self.coord.headers["X-Nightshift-Session"] = reply["session"]
                 break
             except httpx.HTTPError as e:
                 self.log("~", f"coordinator unreachable ({type(e).__name__}); retrying in {delay:.1f}s")

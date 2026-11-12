@@ -108,7 +108,7 @@ Take the Nightshift Grid PoC from an in-memory demo to a crash-resilient, zero-c
 
 ### Still open (outside this checklist)
 - **No TLS.** Bearer tokens travel in cleartext, so use Tailscale/WireGuard or a TLS reverse proxy.
-- **Tokens aren't tied to a `worker_id`.**
+- **A worker token can still register new worker ids.** Live ids are now protected by per-registration sessions.
 - **Single coordinator.** It's durable but not highly available.
 - **Qdrant backfill after a SIGKILL.** Records still in the sink queue when the coordinator is SIGKILLed (under a second's worth) need `backfill`.
 - **Not run on real hardware:** the Linux, Windows and Wayland sensors and installers, battery and thermal guards (tested with fakes only), live `keep_alive: 0` under real memory pressure, and multi-NIC discovery.

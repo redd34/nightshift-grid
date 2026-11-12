@@ -35,10 +35,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import functools
+import hashlib
 import hmac
 import ipaddress
 import os
 import secrets
+import stat
 import sys
 import time
 import uuid
@@ -48,7 +50,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional, TextIO
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from discovery import DISCOVERY_PORT, DiscoveryResponder, default_advertise_url
@@ -98,6 +101,8 @@ class WorkerInfo(BaseModel):
     preempted_count: int = 0
     failed_count: int = 0
     last_seen: float = 0.0
+    # sha256 of the per-registration session secret; server-managed, never returned by status APIs.
+    session_digest: Optional[str] = None
 
 
 class GridTask(BaseModel):
@@ -178,6 +183,17 @@ class TaskFailRequest(BaseModel):
     task_id: str
     lease_id: str
     error: str
+
+
+SESSION_HEADER = "X-Nightshift-Session"
+
+
+def _digest(session: str) -> str:
+    return hashlib.sha256(session.encode()).hexdigest()
+
+
+class WorkerIdInUse(Exception):
+    """A live worker already holds this worker_id and the caller didn't prove it is that worker."""
 
 
 class LeaseError(Exception):
@@ -388,9 +404,28 @@ class GridState:
         return w
 
     # ---- worker API
+    def verify_session(self, worker_id: str, session: Optional[str]) -> WorkerInfo:
+        """Bind every worker call to the registration that created it. The shared worker token only
+        proves "some worker"; without this, any token holder could heartbeat, preempt or steal leases
+        as another live worker_id. Raises KeyError (-> 404, worker re-registers) on unknown/mismatch."""
+        w = self._worker(worker_id)
+        if not session or not w.session_digest or not hmac.compare_digest(_digest(session), w.session_digest):
+            raise KeyError(worker_id)
+        return w
+
     @mutation
-    def register(self, info: WorkerInfo) -> None:
+    def register(self, info: WorkerInfo, session: Optional[str] = None) -> str:
+        """Register (or re-register) a worker and return its new session secret.
+
+        Re-registering a worker_id that is still live requires its current session, so another
+        token holder can't hijack it. A crashed worker's id frees up once it goes OFFLINE
+        (worker_timeout); a graceful shutdown frees it immediately (preempt reason "shutdown")."""
         prev = self.workers.get(info.worker_id)
+        if prev and prev.state != WorkerState.OFFLINE and prev.session_digest and not (
+                session and hmac.compare_digest(_digest(session), prev.session_digest)):
+            raise WorkerIdInUse(info.worker_id)
+        new_session = secrets.token_urlsafe(24)
+        info.session_digest = _digest(new_session)
         if prev:  # re-registration (worker restart / lost contact): keep counters
             info.completed_count, info.preempted_count, info.failed_count = (
                 prev.completed_count, prev.preempted_count, prev.failed_count)
@@ -404,6 +439,7 @@ class GridState:
         self._dirty_workers.add(info.worker_id)
         self.log("NODE_JOINED", f"{info.worker_id} joined (Tier {info.tier}, {info.ram_free_gb:.1f}GB free, {info.model_name})",
                  worker_id=info.worker_id, tier=info.tier)
+        return new_session
 
     @mutation
     def pull(self, worker_id: str) -> GridTask | None:
@@ -457,7 +493,8 @@ class GridState:
     def preempt(self, req: PreemptRequest) -> int:
         w = self._worker(req.worker_id)
         now = self.clock()
-        w.state = WorkerState.PREEMPTED_USER_ACTIVE
+        # A graceful shutdown frees the worker_id immediately so the restarted process can register.
+        w.state = WorkerState.OFFLINE if req.reason == "shutdown" else WorkerState.PREEMPTED_USER_ACTIVE
         w.current_task_id = None
         w.tokens_per_sec = 0.0
         w.preempted_count += 1
@@ -599,7 +636,7 @@ class GridState:
 
     def status(self) -> dict:
         out = {
-            "workers": [w.model_dump() for w in self.workers.values()],
+            "workers": [w.model_dump(exclude={"session_digest"}) for w in self.workers.values()],
             "task_counts": {s.value: self.counts[s.value] for s in TaskState},
             "total_tasks": len(self.tasks),
             "jobs": [self._job_summary(self.jobs[j]) for j in list(self.jobs)[-5:]],
@@ -633,9 +670,27 @@ def _bearer_guard(expected: Optional[str]):
     return guard
 
 
+LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _hostname(value: str) -> str:
+    """Host part of a Host header or Origin URL: 'Example.com:8000' -> 'example.com', '[::1]:80' -> '::1'."""
+    v = value.strip().lower()
+    if "://" in v:
+        v = v.split("://", 1)[1]
+    v = v.split("/", 1)[0]
+    if v.startswith("["):
+        return v[1:v.index("]")] if "]" in v else v
+    return v.rsplit(":", 1)[0] if v.count(":") == 1 else v
+
+
 def create_app(state: GridState | None = None, worker_token: str | None = None,
-               client_token: str | None = None, discovery: DiscoveryResponder | None = None) -> FastAPI:
+               client_token: str | None = None, discovery: DiscoveryResponder | None = None,
+               trusted_hosts: frozenset[str] | set[str] | None = None) -> FastAPI:
+    """`trusted_hosts`: hostnames accepted in Host/Origin headers (loopback names are always allowed)."""
     grid = state or GridState(sink=_sink_from_env())
+    allowed_hosts = LOOPBACK_HOSTS | {h.lower() for h in (trusted_hosts or ())}
+    auth_enabled = bool(worker_token or client_token)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -669,24 +724,49 @@ def create_app(state: GridState | None = None, worker_token: str | None = None,
 
     app = FastAPI(title="Nightshift Grid Coordinator", lifespan=lifespan)
     app.state.grid = grid
+
+    @app.middleware("http")
+    async def host_and_origin_guard(request: Request, call_next):
+        """Browser-borne attacks on the API. Workers, the CLI and MCP never send an Origin header,
+        so any cross-origin browser request (CSRF via a malicious page) is refused outright. When
+        auth is disabled (loopback dev mode), DNS rebinding could still let a web page reach
+        127.0.0.1 under its own hostname - so the Host header must then be a trusted name."""
+        origin = request.headers.get("origin")
+        if origin is not None and _hostname(origin) not in allowed_hosts:
+            return JSONResponse({"detail": "cross-origin requests are not allowed"}, status_code=403)
+        if not auth_enabled and _hostname(request.headers.get("host", "")) not in allowed_hosts:
+            return JSONResponse({"detail": "untrusted Host header (DNS rebinding protection)"}, status_code=403)
+        return await call_next(request)
     worker_api = APIRouter(prefix="/worker", dependencies=[Depends(_bearer_guard(worker_token))])
     client_api = APIRouter(prefix="/v1", dependencies=[Depends(_bearer_guard(client_token))])
 
     def _unknown(worker_id: str):
-        # 404 tells the worker to re-register.
-        return HTTPException(status_code=404, detail=f"worker {worker_id} not registered")
+        # 404 tells the worker to re-register (unknown id, or a session that isn't the current one).
+        return HTTPException(status_code=404, detail=f"worker {worker_id} not registered (or stale session)")
+
+    def _session(worker_id: str, session: Optional[str]) -> None:
+        try:
+            grid.verify_session(worker_id, session)
+        except KeyError:
+            raise _unknown(worker_id)
 
     @app.get("/healthz")
     async def healthz():
         return {"ok": True}  # deliberately unauthenticated and information-free
 
     @worker_api.post("/register")
-    async def register_worker(info: WorkerInfo):
-        grid.register(info)
-        return {"status": "registered", "lease_ttl": grid.lease_ttl, "heartbeat_interval": HEARTBEAT_INTERVAL_SECONDS}
+    async def register_worker(info: WorkerInfo, x_nightshift_session: Optional[str] = Header(default=None)):
+        try:
+            session = grid.register(info, session=x_nightshift_session)
+        except WorkerIdInUse:
+            raise HTTPException(status_code=409, detail=f"worker_id {info.worker_id} is held by a live worker; "
+                                f"it frees up when that worker shuts down or misses heartbeats")
+        return {"status": "registered", "session": session, "lease_ttl": grid.lease_ttl,
+                "heartbeat_interval": HEARTBEAT_INTERVAL_SECONDS}
 
     @worker_api.post("/pull-task")
-    async def pull_task(worker_id: str):
+    async def pull_task(worker_id: str, x_nightshift_session: Optional[str] = Header(default=None)):
+        _session(worker_id, x_nightshift_session)
         try:
             task = grid.pull(worker_id)
         except KeyError:
@@ -697,28 +777,32 @@ def create_app(state: GridState | None = None, worker_token: str | None = None,
                          "chunk_index": task.chunk_index, "prompt": task.prompt, "lease_ttl": grid.lease_ttl}}
 
     @worker_api.post("/heartbeat")
-    async def worker_heartbeat(hb: HeartbeatRequest):
+    async def worker_heartbeat(hb: HeartbeatRequest, x_nightshift_session: Optional[str] = Header(default=None)):
+        _session(hb.worker_id, x_nightshift_session)
         try:
             return grid.heartbeat(hb)
         except KeyError:
             raise _unknown(hb.worker_id)
 
     @worker_api.post("/preempt")
-    async def preempt_worker(req: PreemptRequest):
+    async def preempt_worker(req: PreemptRequest, x_nightshift_session: Optional[str] = Header(default=None)):
+        _session(req.worker_id, x_nightshift_session)
         try:
             return {"reclaimed": grid.preempt(req)}
         except KeyError:
             raise _unknown(req.worker_id)
 
     @worker_api.post("/complete")
-    async def complete_task(req: TaskCompleteRequest):
+    async def complete_task(req: TaskCompleteRequest, x_nightshift_session: Optional[str] = Header(default=None)):
+        _session(req.worker_id, x_nightshift_session)
         try:
             return grid.complete(req)
         except LeaseError as e:
             raise HTTPException(status_code=409, detail=str(e))
 
     @worker_api.post("/fail")
-    async def fail_task(req: TaskFailRequest):
+    async def fail_task(req: TaskFailRequest, x_nightshift_session: Optional[str] = Header(default=None)):
+        _session(req.worker_id, x_nightshift_session)
         try:
             grid.fail(req)
             return {"status": "requeued"}
@@ -788,7 +872,9 @@ def ensure_auto_tokens(token_dir: str | os.PathLike, worker_token: str | None, c
     stdout = stdout or sys.stdout
     stderr = stderr or sys.stderr
     d = Path(token_dir)
-    d.mkdir(parents=True, exist_ok=True)
+    if not d.exists():
+        d.mkdir(parents=True, mode=0o700)
+    _check_private_dir(d)
     tokens = {"worker": worker_token, "client": client_token}
     sources = {"worker": "configured", "client": "configured"}
     minted: dict[str, str] = {}
@@ -799,7 +885,7 @@ def ensure_auto_tokens(token_dir: str | os.PathLike, worker_token: str | None, c
         try:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
-            tokens[role], _ = resolve_token(str(path), ())  # warns if the file is group/world-readable
+            tokens[role] = _read_trusted_secret(path)
             sources[role] = f"auto file {path} (reused)"
             continue
         tok = secrets.token_urlsafe(32)
@@ -820,6 +906,41 @@ def ensure_auto_tokens(token_dir: str | os.PathLike, worker_token: str | None, c
                 print(f"  {role} token (shown once): {tok}", file=stdout)
     assert tokens["worker"] and tokens["client"]
     return tokens["worker"], tokens["client"], sources["worker"], sources["client"]
+
+
+def _check_private_dir(d: Path) -> None:
+    """The token dir must not be writable by anyone else: otherwise another local user could plant
+    a token file (or a symlink) before our first run and know - or redirect - the grid's secret."""
+    if os.name != "posix":
+        return
+    st = d.stat()
+    if st.st_uid != os.getuid() or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise GridAuthError(f"token directory {d} must be owned by you and not group/world-writable "
+                            f"(chmod 700 {d})")
+
+
+def _read_trusted_secret(path: Path) -> str:
+    """Read a reused auto-token, refusing anything we didn't plausibly create ourselves: symlinks
+    (O_NOFOLLOW), non-regular files, files owned by another user, or files with any group/other
+    permission bits. A mismatch is a hard error, never a warning - silently trusting a planted
+    token would hand the grid to whoever planted it."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as e:
+        raise GridAuthError(f"cannot open token file {path} safely ({e.strerror}); is it a symlink?") from e
+    with os.fdopen(fd, encoding="utf-8") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise GridAuthError(f"token file {path} is not a regular file")
+        if os.name == "posix" and (st.st_uid != os.getuid() or st.st_mode & 0o077):
+            raise GridAuthError(f"token file {path} must be owned by you with mode 0600 "
+                                f"(found uid {st.st_uid}, mode {stat.S_IMODE(st.st_mode):o}); "
+                                f"fix it or delete it to mint a new token")
+        token = f.read().strip()
+    if not token:
+        raise GridAuthError(f"token file {path} is empty")
+    return token
 
 
 def _build_sink(a: argparse.Namespace) -> GraphSink:
@@ -861,6 +982,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--auto-token", action="store_true",
                    help="generate any missing worker/client token into 0600 files next to --db and reuse them later")
     p.add_argument("--allow-insecure", action="store_true", help="allow a non-loopback bind without tokens (not recommended)")
+    p.add_argument("--trusted-host", action="append", default=[], metavar="NAME",
+                   help="extra hostname accepted in Host/Origin headers (repeatable; loopback names always allowed)")
     g = p.add_argument_group("LAN discovery")
     g.add_argument("--advertise", action=argparse.BooleanOptionalAction, default=None,
                    help="answer UDP discovery probes (default: on for a non-loopback --host, off on loopback)")
@@ -919,7 +1042,13 @@ def main(argv: list[str] | None = None) -> None:
     sink = _build_sink(a)
     store = None if a.db.lower() == "none" else GridStore(a.db)
     grid = GridState(sink=sink, store=store)
-    uvicorn.run(create_app(grid, worker_token=worker_token, client_token=client_token, discovery=responder),
+    trusted = set(a.trusted_host)
+    if not _is_loopback(a.host) and a.host not in ("0.0.0.0", "::"):
+        trusted.add(a.host)
+    if responder is not None:
+        trusted.add(_hostname(responder.advertise_url))
+    uvicorn.run(create_app(grid, worker_token=worker_token, client_token=client_token, discovery=responder,
+                           trusted_hosts=trusted),
                 host=a.host, port=a.port, log_level="warning")
 
 

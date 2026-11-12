@@ -91,8 +91,7 @@ def test_random_operation_sequences_keep_invariants(tmp_path, seed):
     rng, clock = random.Random(seed), Clock()
     g = boot(tmp_path, clock)
     workers = [("w1", 1), ("w2", 2), ("w3", 3)]
-    for wid, tier in workers:
-        g.register(WorkerInfo(worker_id=wid, tier=tier))
+    sessions = {wid: g.register(WorkerInfo(worker_id=wid, tier=tier)) for wid, tier in workers}
     jobs = [g.submit(BatchSubmitRequest(job_name=f"j{i}", chunks=[f"c{i}-{k}" for k in range(6)], required_tier=rng.randint(1, 3)))
             for i in range(3)]
     held: dict[str, tuple[str, str]] = {}
@@ -121,7 +120,8 @@ def test_random_operation_sequences_keep_invariants(tmp_path, seed):
             elif op < 0.90:
                 clock.advance(rng.choice([1, 5, 13])); g.reap()
             elif op < 0.93:
-                g.register(WorkerInfo(worker_id=wid, tier=_tier)); held.pop(wid, None)
+                sessions[wid] = g.register(WorkerInfo(worker_id=wid, tier=_tier), session=sessions[wid])
+                held.pop(wid, None)
             elif op < 0.96:
                 g.store.close(); g = boot(tmp_path, clock)          # crash + recover
         except LeaseError:
@@ -157,14 +157,54 @@ def test_auth_separates_worker_and_client_roles(client):
     assert client.get("/healthz").status_code == 200
     assert client.post("/worker/register", json={"worker_id": "w"}).status_code == 401
     assert client.post("/worker/register", json={"worker_id": "w"}, headers={"Authorization": "Bearer nope"}).status_code == 401
-    assert client.post("/worker/register", json={"worker_id": "w"}, headers=W).status_code == 200
+    reg = client.post("/worker/register", json={"worker_id": "w"}, headers=W)
+    assert reg.status_code == 200
+    WS = {**W, "X-Nightshift-Session": reg.json()["session"]}
     job = {"job_name": "j", "chunks": ["a"]}
     assert client.post("/v1/grid/mapreduce", json=job, headers=W).status_code == 401  # worker can't submit
     assert client.get("/v1/grid/status", headers=W).status_code == 401                # ...or read results
     assert client.post("/v1/grid/mapreduce", json=job, headers=C).status_code == 200
     assert client.post("/worker/pull-task", params={"worker_id": "w"}, headers=C).status_code == 401
-    r = client.post("/worker/pull-task", params={"worker_id": "w"}, headers=W)
+    # The shared worker token alone can't act as, or take over, a live worker: identity is session-bound.
+    assert client.post("/worker/pull-task", params={"worker_id": "w"}, headers=W).status_code == 404
+    assert client.post("/worker/pull-task", params={"worker_id": "w"},
+                       headers={**W, "X-Nightshift-Session": "forged"}).status_code == 404
+    assert client.post("/worker/register", json={"worker_id": "w"}, headers=W).status_code == 409
+    r = client.post("/worker/pull-task", params={"worker_id": "w"}, headers=WS)
     assert r.status_code == 200 and r.json()["task"]["prompt"] == "a"
+
+
+def test_browser_origin_and_dns_rebinding_are_refused(tmp_path):
+    app = create_app(GridState())  # auth disabled: loopback dev mode
+    with TestClient(app, base_url="http://127.0.0.1") as c:
+        assert c.get("/healthz").status_code == 200
+        assert c.get("/v1/grid/status", headers={"Origin": "http://evil.example"}).status_code == 403
+        assert c.get("/v1/grid/status", headers={"Host": "evil.example"}).status_code == 403   # rebinding
+        assert c.get("/v1/grid/status", headers={"Host": "localhost:8000"}).status_code == 200
+    with TestClient(create_app(GridState(), worker_token="w", client_token="c"), base_url="http://10.0.0.5") as c:
+        # With auth on, a LAN Host is fine (the token is the protection), but browsers still can't cross origins.
+        assert c.get("/healthz").status_code == 200
+        assert c.get("/healthz", headers={"Origin": "http://evil.example"}).status_code == 403
+
+
+def test_reused_token_file_must_be_private_and_not_a_symlink(tmp_path):
+    import os
+    from coordinator import ensure_auto_tokens
+    from grid_auth import GridAuthError
+    d = tmp_path / "state"; d.mkdir(mode=0o700)
+    ensure_auto_tokens(d, None, None)
+    (d / "worker.token").chmod(0o644)                    # world-readable -> refuse
+    with pytest.raises(GridAuthError, match="mode 0600"):
+        ensure_auto_tokens(d, None, None)
+    (d / "worker.token").unlink()
+    (tmp_path / "planted").write_text("attacker-known\n"); (tmp_path / "planted").chmod(0o600)
+    os.symlink(tmp_path / "planted", d / "worker.token")  # planted symlink -> refuse
+    with pytest.raises(GridAuthError, match="symlink"):
+        ensure_auto_tokens(d, None, None)
+    os.unlink(d / "worker.token"); d.chmod(0o777)          # world-writable dir -> refuse
+    with pytest.raises(GridAuthError, match="not group/world-writable"):
+        ensure_auto_tokens(d, None, None)
+    d.chmod(0o700)
 
 
 def test_request_limits(client):

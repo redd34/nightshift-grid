@@ -121,7 +121,7 @@ def test_qdrant_memory_wiring_exposes_sink_stats(tmp_path, run_main):
 
     cap = run_main(["--db", str(tmp_path / "g.db"), "--output", str(tmp_path / "o.jsonl"), "--qdrant-memory",
                     "--qdrant-embedder", "hash", "--qdrant-collection", "nightshift_cli_test"])
-    with TestClient(cap["app"]) as c:
+    with TestClient(cap["app"], base_url="http://127.0.0.1") as c:
         st = c.get("/v1/grid/status").json()
     assert st["sink"]["qdrant"]["collection"] == "nightshift_cli_test"
     assert st["sink"]["qdrant"]["embedder"] == "hash-v1:768"
