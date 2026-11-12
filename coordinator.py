@@ -56,7 +56,7 @@ from pydantic import BaseModel, Field
 
 from discovery import DISCOVERY_PORT, DiscoveryResponder, default_advertise_url
 from graphrag import ExtractionError, GraphSink, JsonlGraphSink, NullSink, normalize_extraction
-from relay import MAX_CKPT_CHARS, valid_checkpoint
+from relay import MAX_CKPT_CHARS, validated_checkpoint
 from grid_auth import (CLIENT_TOKEN_ENV, WORKER_TOKEN_ENV, GridAuthError, credential_worker_id, resolve_token,
                        verify_worker_credential)
 from grid_tls import TLSConfigError, cert_sans, default_sans, ensure_self_signed, fingerprint_file
@@ -143,6 +143,7 @@ class GridTask(BaseModel):
     tokens_salvaged: int = 0       # tokens successors did not have to decode again
     output_tokens: int = 0         # tokens in the accepted result
     resumes: int = 0
+    relay_discards: int = 0        # resumed attempts that failed; after one, this task never resumes again
     hops: list[dict] = Field(default_factory=list)  # relay ledger (last MAX_HOPS leases)
 
 
@@ -359,8 +360,8 @@ class GridState:
         self.leased.add(task.task_id)
         self.leases_by_worker.setdefault(worker_id, set()).add(task.task_id)
         w = self.workers.get(worker_id)
-        usable = (self.relay and task.ckpt_tokens > 0 and bool(task.ckpt_text) and w is not None
-                  and w.model_name == task.ckpt_model)
+        usable = (self.relay and task.relay_discards == 0 and task.ckpt_tokens > 0 and bool(task.ckpt_text)
+                  and w is not None and w.model_name == task.ckpt_model)
         task.lease_start_tokens = task.ckpt_tokens if usable else 0
         task.lease_reported_tokens = task.lease_start_tokens
         if usable:
@@ -411,11 +412,14 @@ class GridState:
             return False  # nothing new (already acknowledged)
         if len(text) > MAX_CKPT_CHARS or len(text) < len(task.ckpt_text):
             return False  # only progress replaces a checkpoint (a rolled-back resume catches up first)
-        if not valid_checkpoint(text):
-            return False  # untrusted input to another worker's prompt: JSON prefix only, no template tokens
+        good = validated_checkpoint(text)  # untrusted input to another worker's prompt: store only the validated prefix
+        if good is None or len(good) <= len(task.ckpt_text):
+            return False
         w = self.workers.get(task.assigned_worker or "")
-        # A token is at least one character of text, so a checkpoint can't claim more tokens than chars.
-        task.ckpt_text, task.ckpt_tokens = text, min(len(text), max(cp.gen_tokens, task.lease_start_tokens))
+        # Tokens scale with the stored share of the text; a token is >= 1 char, so never more than len(good).
+        claimed = max(cp.gen_tokens, task.lease_start_tokens)
+        task.ckpt_text = good
+        task.ckpt_tokens = min(len(good), max(task.lease_start_tokens, claimed * len(good) // max(1, len(text))))
         task.ckpt_model = w.model_name if w else ""
         self._dirty_tasks.add(task.task_id)
         return True
@@ -671,18 +675,20 @@ class GridState:
     def _fail(self, task: GridTask, worker_id: str, error: str) -> None:
         resumed = task.lease_start_tokens > 0
         self._drop_checkpoint(task)
-        if resumed:
-            # The prefix (written by another worker) is the likely culprit, not this worker or the chunk:
-            # retry from scratch without spending the chunk's failure budget. Bounded: the checkpoint is
-            # gone, so the next attempt is a fresh one.
-            self.log("RELAY_DISCARDED", f"Chunk #{task.chunk_index}: resumed attempt on {worker_id} failed "
-                     f"({error[:80]}); checkpoint dropped, restarting from token 0", task, worker_id)
-            self._requeue(task)
-            return
         w = self.workers.get(worker_id)
         if w:
-            w.failed_count += 1
+            w.failed_count += 1  # counted either way: per-node failure rates must stay honest
             self._dirty_workers.add(worker_id)
+        if resumed and task.relay_discards == 0:
+            # The prefix (written by another worker) is the likely culprit, not the chunk: retry once from
+            # scratch without spending the chunk's failure budget. Exactly once: relay_discards disables
+            # relay for this task from now on, so a poisoning worker can't buy unlimited free retries.
+            task.relay_discards += 1
+            self.log("RELAY_DISCARDED", f"Chunk #{task.chunk_index}: resumed attempt on {worker_id} failed "
+                     f"({error[:80]}); checkpoint dropped, relay disabled for this chunk, restarting from token 0",
+                     task, worker_id)
+            self._requeue(task)
+            return
         self.log("TASK_FAILED", f"Chunk #{task.chunk_index} failed on {worker_id}: {error[:120]}", task, worker_id)
         self._record_failure(task, error)
 

@@ -24,25 +24,32 @@ Resume ladder (worker side):
 from __future__ import annotations
 
 import json
+import re
 from typing import Awaitable, Callable, Optional
 
 MAX_CKPT_CHARS = 64_000      # coordinator-side cap on a stored checkpoint
 MAX_RESUME_TOKENS = 1024     # cap on any continuation: a runaway resume must never hog a node
 MAX_ITEMS = 48               # cap on grammar-resumed array items
-# Chat-template control sequences. A checkpoint is untrusted input to the *next* worker's raw prompt,
-# so text containing any of these is never stored or rendered (it could otherwise close the assistant
-# turn and inject a system/user message into another node's model).
-TEMPLATE_MARKERS = ("<|", "|>", "<think", "</think", "<s>", "</s>", "[INST]", "<start_of_turn>", "<end_of_turn>")
+# A checkpoint is untrusted input to the *next* worker's raw prompt: special tokens in it could close
+# the assistant turn and inject a system/user message into another node's model. Allowlist, not a
+# denylist of known tokens: checkpoints may not contain '<' or '>' at all (extraction JSON never needs
+# them raw), and a chunk is only resumed if it has no tag-like '<x', '</', '<|' or '<!' sequence.
+_TAG_LIKE = re.compile(r"<[A-Za-z/|!]")
 
 
 def safe_for_raw_prompt(text: str) -> bool:
-    return not any(m in text for m in TEMPLATE_MARKERS)
+    """For the chunk (user) text rendered into a resume prompt."""
+    return _TAG_LIKE.search(text) is None
 
 
-def valid_checkpoint(text: str) -> bool:
-    """What a coordinator accepts as a relay checkpoint: an extraction-JSON prefix (per the online
-    validator) with no chat-template control sequences."""
-    return text.lstrip().startswith("{") and safe_for_raw_prompt(text) and closable(text) is not None
+def validated_checkpoint(text: str) -> Optional[str]:
+    """What a coordinator stores for `text`: its validated extraction-JSON prefix (ends at the last
+    complete array item, so no unvalidated tail and nothing after the object closes), or None if
+    the text isn't an extraction prefix or contains any angle bracket."""
+    if not text.lstrip().startswith("{") or "<" in text or ">" in text:
+        return None
+    good = closable(text)
+    return good or None
 
 
 # --------------------------------------------------------------------------- JSON progress

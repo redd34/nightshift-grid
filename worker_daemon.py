@@ -254,9 +254,12 @@ class PreemptibleEdgeWorker:
         return out
 
     def ack_checkpoint(self, sent: dict, reply: dict, epoch: int) -> None:
-        if "ckpt_delta" in sent and epoch == self.ckpt_epoch and \
-                reply.get("ckpt_len") == sent["ckpt_from"] + len(sent["ckpt_delta"]):
-            self.ckpt_acked = reply["ckpt_len"]
+        # The coordinator stores only the validated prefix of what we sent, so it may keep less than all
+        # of it. Anything in [from, from+len(delta)] is a prefix of our text and safe to build on.
+        n = reply.get("ckpt_len")
+        if "ckpt_delta" in sent and epoch == self.ckpt_epoch and isinstance(n, int) and \
+                sent["ckpt_from"] <= n <= sent["ckpt_from"] + len(sent["ckpt_delta"]):
+            self.ckpt_acked = max(self.ckpt_acked, n)
 
     async def notify_preempt(self, reason: str, detected_at: float, lease_id: Optional[str] = None) -> None:
         try:
@@ -562,8 +565,8 @@ class PreemptibleEdgeWorker:
     async def work_one(self, task: dict) -> None:
         self.task_id, self.lease_id, self.cancel_reason = task["task_id"], task["lease_id"], None
         self.resume = task.get("resume") if self.can_resume else None
-        if self.resume and not self.mock and not (safe_for_raw_prompt(self.resume.get("text", ""))
-                                                  and safe_for_raw_prompt(task["prompt"])):
+        text = (self.resume or {}).get("text", "")
+        if self.resume and not self.mock and ("<" in text or ">" in text or not safe_for_raw_prompt(task["prompt"])):
             self.log("!", f"chunk #{task['chunk_index']}: refusing resume (chat-template tokens in prefix or chunk); "
                           f"starting from token 0")
             self.resume = None
