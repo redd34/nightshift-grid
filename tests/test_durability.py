@@ -219,3 +219,18 @@ def test_refuses_insecure_lan_bind(monkeypatch):
         monkeypatch.delenv(k, raising=False)
     with pytest.raises(SystemExit, match="Refusing to bind"):
         coordinator.main(["--host", "0.0.0.0", "--db", "none", "--output", "none"])
+
+
+def test_recovery_does_not_open_a_window_to_hijack_live_worker_ids(tmp_path):
+    from coordinator import WorkerIdInUse
+    clock = Clock()
+    g = boot(tmp_path, clock)
+    session = g.register(WorkerInfo(worker_id="w1", tier=1))
+    g.store.close(); clock.advance(2)
+    g2 = boot(tmp_path, clock)                       # every recovered worker is OFFLINE now...
+    assert g2.workers["w1"].state == WorkerState.OFFLINE
+    with pytest.raises(WorkerIdInUse):               # ...but its id is still protected
+        g2.register(WorkerInfo(worker_id="w1", tier=1))
+    assert g2.verify_session("w1", session)          # the real worker carries on with its session
+    clock.advance(13)                                # no contact for worker_timeout -> id released
+    assert g2.register(WorkerInfo(worker_id="w1", tier=1))

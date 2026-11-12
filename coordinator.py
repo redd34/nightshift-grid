@@ -417,11 +417,14 @@ class GridState:
     def register(self, info: WorkerInfo, session: Optional[str] = None) -> str:
         """Register (or re-register) a worker and return its new session secret.
 
-        Re-registering a worker_id that is still live requires its current session, so another
-        token holder can't hijack it. A crashed worker's id frees up once it goes OFFLINE
-        (worker_timeout); a graceful shutdown frees it immediately (preempt reason "shutdown")."""
+        Re-registering a worker_id that holds a session requires that session, so another token
+        holder can't hijack it. The id is released only by (a) a graceful shutdown, which revokes
+        the session, or (b) `worker_timeout` without any contact, measured from last_seen. It is
+        deliberately NOT released by the OFFLINE *state*: after coordinator recovery every worker
+        is OFFLINE until it heartbeats, and recovery resets last_seen to now precisely so that
+        window can't be used to steal a live worker's id."""
         prev = self.workers.get(info.worker_id)
-        if prev and prev.state != WorkerState.OFFLINE and prev.session_digest and not (
+        if prev and prev.session_digest and self.clock() - prev.last_seen <= self.worker_timeout and not (
                 session and hmac.compare_digest(_digest(session), prev.session_digest)):
             raise WorkerIdInUse(info.worker_id)
         new_session = secrets.token_urlsafe(24)
@@ -493,8 +496,10 @@ class GridState:
     def preempt(self, req: PreemptRequest) -> int:
         w = self._worker(req.worker_id)
         now = self.clock()
-        # A graceful shutdown frees the worker_id immediately so the restarted process can register.
+        # A graceful shutdown revokes the session, freeing the worker_id for the restarted process.
         w.state = WorkerState.OFFLINE if req.reason == "shutdown" else WorkerState.PREEMPTED_USER_ACTIVE
+        if req.reason == "shutdown":
+            w.session_digest = None
         w.current_task_id = None
         w.tokens_per_sec = 0.0
         w.preempted_count += 1

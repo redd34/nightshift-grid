@@ -607,8 +607,8 @@ def _sanitize(obj: Any, cap: int = UNTRUSTED_STR_CAP) -> Any:
     if isinstance(obj, str):
         clean = _HIDDEN_CHARS.sub("", obj)
         return clean if len(clean) <= cap else clean[:cap] + "…[truncated]"
-    if isinstance(obj, dict):
-        return {k: _sanitize(v, cap) for k, v in obj.items()}
+    if isinstance(obj, dict):  # keys too: e.g. top_relations is keyed by model-produced relation names
+        return {(_sanitize(k, cap) if isinstance(k, str) else k): _sanitize(v, cap) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_sanitize(v, cap) for v in obj]
     return obj

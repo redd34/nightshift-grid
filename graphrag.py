@@ -57,10 +57,14 @@ def _clean(value: Any) -> str | None:
     return None
 
 
+MAX_RELATION_CHARS = 64  # a relation is a verb phrase; anything longer is noise or an injection payload
+
+
 def canonical_relation(rel: str) -> str:
-    """'exceeded during' / 'exceededDuring' -> 'EXCEEDED_DURING' so edges merge across chunks/models."""
+    """'exceeded during' / 'exceededDuring' -> 'EXCEEDED_DURING' so edges merge across chunks/models.
+    Output is [0-9A-Z_] only and capped, so relation names are safe to use as keys downstream."""
     rel = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", rel)
-    return re.sub(r"[^0-9A-Za-z]+", "_", rel).strip("_").upper()
+    return re.sub(r"[^0-9A-Za-z]+", "_", rel).strip("_").upper()[:MAX_RELATION_CHARS].rstrip("_")
 
 
 def _coerce_triple(item: Any) -> list[str] | None:
