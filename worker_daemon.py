@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import importlib
 import json
 import os
@@ -48,6 +49,7 @@ import httpx
 import psutil
 
 from graphrag import EXTRACTION_SCHEMA, SYSTEM_PROMPT, ExtractionError, normalize_extraction
+from relay import MAX_RESUME_TOKENS, ChatML, closable, first_json, json_done, scan_checkpoint, structured_resume
 from grid_auth import (TOKEN_FILE_ENV, WORKER_TOKEN_ENV, GridAuthError, bearer_headers, check_auth,
                        credential_worker_id, resolve_token)
 from grid_tls import CA_FILE_ENV, FINGERPRINT_ENV, TLSConfigError, client_verify, normalize_fingerprint
@@ -86,6 +88,22 @@ class CancelReason:
     PREEMPTED = "preempted"
     LEASE_LOST = "lease_lost"
     SHUTDOWN = "shutdown"
+
+
+class _Slip(Exception):
+    """Naive resume produced invalid JSON; switch to the grammar-constrained rung."""
+
+
+def mock_output(prompt: str) -> tuple[str, list[str]]:
+    """Deterministic mock 'model output' for a prompt, split into 50-90 stream pieces."""
+    ids = re.findall(r"\b(?:PLC-Node-\d+|B-\d+|register \d+|Equipment Log #\d+)", prompt)
+    subject = ids[0] if ids else prompt[:24]
+    triples = [{"subject": subject, "relation": "MENTIONS", "object": o} for o in ids[1:]] or \
+              [{"subject": subject, "relation": "MENTIONS", "object": "unknown"}]
+    text = json.dumps({"entities": ids, "triples": triples})
+    n = 50 + hashlib.sha256(prompt.encode()).digest()[0] % 41
+    step = max(1, -(-len(text) // n))
+    return text, [text[i:i + step] for i in range(0, len(text), step)]
 
 
 class PreemptibleEdgeWorker:
@@ -143,6 +161,17 @@ class PreemptibleEdgeWorker:
         self._registrations = 0
         self._background: set[asyncio.Task] = set()  # fire-and-forget work (model unloads)
 
+        # Baton token relay: the generation-so-far of the current lease, shipped to the coordinator
+        # as heartbeat deltas so another worker can continue it if this lease ends early.
+        self.relay_on = False            # coordinator said so at registration
+        self.can_resume = self.mock      # live: verified per model in check_ollama()
+        self.gen_lease: Optional[str] = None
+        self.gen_pieces: list[str] = []
+        self.gen_tokens = 0              # cumulative, including tokens handed to us on resume
+        self.ckpt_acked = 0              # chars of our text the coordinator has stored
+        self.ckpt_epoch = 0              # bumped when our text is rewritten (structured resume)
+        self.resume: Optional[dict] = None
+
         self.coord: httpx.AsyncClient  # set in run()
         self.ollama: httpx.AsyncClient
 
@@ -183,6 +212,7 @@ class PreemptibleEdgeWorker:
                 r.raise_for_status()
                 reply = body(r)
                 self.heartbeat_interval = reply.get("heartbeat_interval", 3.0)
+                self.relay_on = bool(reply.get("relay"))
                 if reply.get("session"):
                     # Binds every later call to this registration; never logged.
                     self.coord.headers["X-Nightshift-Session"] = reply["session"]
@@ -205,10 +235,33 @@ class PreemptibleEdgeWorker:
                 self.log("x", f"FATAL: {e}")
             raise
 
+    # ------------------------------------------------------------------ Baton checkpoints
+    @property
+    def ckpt_enabled(self) -> bool:
+        return self.relay_on and self.can_resume
+
+    def progress(self, lease_id: Optional[str]) -> dict:
+        """Progress fields for heartbeat/preempt: cumulative tokens, plus the not-yet-stored tail
+        of our text when relay is on. Empty unless `lease_id` is the lease we are generating for."""
+        if lease_id is None or lease_id != self.gen_lease:
+            return {}
+        out: dict = {"gen_tokens": self.gen_tokens}
+        if self.ckpt_enabled:
+            text = "".join(self.gen_pieces)
+            if len(text) > self.ckpt_acked:
+                out["ckpt_from"], out["ckpt_delta"] = self.ckpt_acked, text[self.ckpt_acked:]
+        return out
+
+    def ack_checkpoint(self, sent: dict, reply: dict, epoch: int) -> None:
+        if "ckpt_delta" in sent and epoch == self.ckpt_epoch and \
+                reply.get("ckpt_len") == sent["ckpt_from"] + len(sent["ckpt_delta"]):
+            self.ckpt_acked = reply["ckpt_len"]
+
     async def notify_preempt(self, reason: str, detected_at: float, lease_id: Optional[str] = None) -> None:
         try:
             r = await self.coord.post("/worker/preempt", json={
-                "worker_id": self.worker_id, "reason": reason, "detected_at": detected_at, "lease_id": lease_id})
+                "worker_id": self.worker_id, "reason": reason, "detected_at": detected_at, "lease_id": lease_id,
+                **self.progress(lease_id)})  # the exact text at the moment of yield: zero tokens lost
             if r.status_code == 404:
                 await self.register()
         except httpx.HTTPError as e:
@@ -221,12 +274,15 @@ class PreemptibleEdgeWorker:
             state = ("PREEMPTED_USER_ACTIVE" if self.monitor.active
                      else "BUSY_INFERENCING" if self.task_id else "IDLE_HARVESTING")
             task_id, lease_id = self.task_id, self.lease_id
+            prog, epoch = self.progress(lease_id), self.ckpt_epoch
             try:
                 r = await self.coord.post("/worker/heartbeat", json={
                     "worker_id": self.worker_id, "task_id": task_id, "lease_id": lease_id,
                     "tokens_per_sec": round(self.tokens_per_sec, 1), "cpu_percent": psutil.cpu_percent(interval=None),
-                    "ram_free_gb": round(psutil.virtual_memory().available / GB, 2), "state": state,
+                    "ram_free_gb": round(psutil.virtual_memory().available / GB, 2), "state": state, **prog,
                 }, timeout=3.0)
+                if r.status_code == 200:
+                    self.ack_checkpoint(prog, body(r), epoch)
                 if r.status_code == 404:
                     self.log("~", "coordinator forgot us (restart?); re-registering")
                     self.cancel_inference(CancelReason.LEASE_LOST)
@@ -351,22 +407,92 @@ class PreemptibleEdgeWorker:
                              f"Run `ollama pull {self.model}` or pass --model.")
         show = (await self.ollama.post("/api/show", json={"model": self.model})).json()
         self.supports_thinking = "thinking" in show.get("capabilities", [])
+        self.can_resume = await ChatML.verify(self.ollama, self.model, SYSTEM_PROMPT, self.supports_thinking)
 
     async def infer(self, prompt: str) -> tuple[dict, float]:
         return await (self._infer_mock(prompt) if self.mock else self._infer_ollama(prompt))
 
+    def _tick(self, piece: str, start: float, append: bool = True) -> None:
+        """One decoded token: record it (append=False for grammar-resume items, which arrive whole)."""
+        if append:
+            self.gen_pieces.append(piece)
+        self.gen_tokens += 1
+        self._gen_new += 1
+        self.tokens_per_sec = self._gen_new / max(0.05, time.monotonic() - start)
+
+    async def _stream_raw(self, prompt: str, fmt: Optional[dict], limit: Optional[int], start: float,
+                          append: bool, stop_at_close: bool = False) -> str:
+        """Raw /api/generate stream (resume path). Leaving the loop closes the socket -> Ollama stops."""
+        payload = {"model": self.model, "raw": True, "stream": True, "keep_alive": "10m", "prompt": prompt,
+                   "options": {"num_ctx": 4096, "temperature": 0.1, "num_predict": limit or MAX_RESUME_TOKENS}}
+        if fmt is not None:
+            payload["format"] = fmt
+        out: list[str] = []
+        async with self.ollama.stream("POST", "/api/generate", json=payload) as resp:
+            if resp.status_code != 200:
+                raise RuntimeError(f"ollama HTTP {resp.status_code}: {(await resp.aread())[:200]!r}")
+            async for line in resp.aiter_lines():
+                if not line:
+                    continue
+                data = json.loads(line)
+                if "error" in data:
+                    raise RuntimeError(f"ollama error: {data['error']}")
+                piece = data.get("response") or ""
+                if piece:
+                    out.append(piece)
+                    self._tick(piece, start, append)
+                    if stop_at_close:
+                        text = "".join(self.gen_pieces)
+                        if json_done(text):
+                            break
+                        if piece.rstrip()[-1:] in ('"', "}", "]") and closable(text) is None:
+                            raise _Slip()  # syntax slip: fall back to the grammar-constrained rung
+                if data.get("done"):
+                    break
+        return "".join(out)
+
+    async def _resume_ollama(self, prompt: str, start: float) -> tuple[dict, float]:
+        """Baton resume ladder (see relay.py): naive continuation -> grammar-per-item -> fail/restart."""
+        prefix = "".join(self.gen_pieces)
+        render = lambda p: ChatML.render(SYSTEM_PROMPT, prompt, p, self.supports_thinking)  # noqa: E731
+        if closable(prefix) is not None:
+            try:
+                await self._stream_raw(render(prefix), None, None, start, append=True, stop_at_close=True)
+                return normalize_extraction(first_json("".join(self.gen_pieces)), source_text=prompt), self.tokens_per_sec
+            except (_Slip, ExtractionError):
+                pass
+        good = closable("".join(self.gen_pieces)) or closable(prefix) or ""
+        if not good or scan_checkpoint(good)["arrays_opened"] == 0:
+            raise ExtractionError("resume checkpoint unusable")  # -> fail -> coordinator drops it -> restart
+        self.log("»", f"naive resume slipped; grammar-constrained resume from a validated boundary ({len(good)} chars)")
+        self.ckpt_epoch += 1
+        self.gen_pieces = [good]
+        self.ckpt_acked = min(self.ckpt_acked, len(good))
+
+        def on_text(t: str) -> None:
+            self.gen_pieces = [t]
+
+        async def raw(p: str, fmt: Optional[dict], limit: Optional[int]) -> str:
+            return await self._stream_raw(p, fmt, limit, start, append=False)
+        out = await structured_resume(raw, render, good, on_text=on_text)
+        return normalize_extraction(out, source_text=prompt), self.tokens_per_sec
+
     async def _infer_ollama(self, prompt: str) -> tuple[dict, float]:
+        start = time.monotonic()
+        self._gen_new = 0
+        if self.resume:
+            return await self._resume_ollama(prompt, start)
         payload = {
             "model": self.model,
             "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
             "format": EXTRACTION_SCHEMA,
             "stream": True,
             "keep_alive": "10m",
-            "options": {"num_ctx": 4096, "temperature": 0.1},
+            "options": {"num_ctx": 4096, "temperature": 0.1, "num_predict": 4 * MAX_RESUME_TOKENS},
         }
         if self.supports_thinking:
             payload["think"] = False  # reasoning tokens are wasted work for extraction
-        start, n, collected, final = time.monotonic(), 0, [], {}
+        final = {}
         async with self.ollama.stream("POST", "/api/chat", json=payload) as resp:
             if resp.status_code != 200:
                 raise RuntimeError(f"ollama HTTP {resp.status_code}: {(await resp.aread())[:200]!r}")
@@ -378,26 +504,35 @@ class PreemptibleEdgeWorker:
                     raise RuntimeError(f"ollama error: {data['error']}")
                 piece = data.get("message", {}).get("content", "")
                 if piece:
-                    collected.append(piece)
-                    n += 1
-                    self.tokens_per_sec = n / max(0.05, time.monotonic() - start)
+                    self._tick(piece, start)
                 if data.get("done"):
                     final = data
                     break
         if final.get("eval_count") and final.get("eval_duration"):
             self.tokens_per_sec = final["eval_count"] / (final["eval_duration"] / 1e9)  # exact decode speed
-        return normalize_extraction("".join(collected)), self.tokens_per_sec
+            self.gen_tokens = final["eval_count"]  # exact (stream chunks can carry >1 token)
+        return normalize_extraction("".join(self.gen_pieces)), self.tokens_per_sec
 
     async def _infer_mock(self, prompt: str) -> tuple[dict, float]:
-        """Simulated token stream (~25 tok/s) with a plausible extraction, cancellable at any await."""
-        start, total = time.monotonic(), self.rng.randint(50, 90)
-        for i in range(total):
+        """Simulated token stream (~25 tok/s) with a plausible extraction, cancellable at any await.
+        The output is a pure function of the prompt, streamed as 50-90 'tokens', so a relayed
+        generation can be checked byte-for-byte against an uninterrupted one."""
+        target, pieces = mock_output(prompt)
+        start_at = 0
+        if self.resume:
+            if not target.startswith(self.resume["text"]) or self.resume["tokens"] > len(pieces):
+                raise ExtractionError("resume prefix does not match this model's output")
+            start_at = self.resume["tokens"]
+        start = time.monotonic()
+        for i in range(start_at, len(pieces)):
             await asyncio.sleep(0.04)
-            self.tokens_per_sec = (i + 1) / (time.monotonic() - start)
-        ids = re.findall(r"\b(?:PLC-Node-\d+|B-\d+|register \d+|Equipment Log #\d+)", prompt)
-        subject = ids[0] if ids else prompt[:24]
-        triples = [[subject, "MENTIONS", other] for other in ids[1:]] or [[subject, "MENTIONS", "unknown"]]
-        return normalize_extraction({"entities": ids, "triples": triples}), self.tokens_per_sec
+            self.gen_pieces.append(pieces[i])
+            self.gen_tokens = i + 1
+            self.tokens_per_sec = (i + 1 - start_at) / (time.monotonic() - start)
+        out = "".join(self.gen_pieces)
+        if out != target:
+            raise ExtractionError("relayed output diverged from the uninterrupted output")
+        return normalize_extraction(out), self.tokens_per_sec
 
     # ------------------------------------------------------------------ main loop
     async def report(self, path: str, payload: dict, deadline_s: float = 30.0) -> Optional[httpx.Response]:
@@ -425,6 +560,13 @@ class PreemptibleEdgeWorker:
 
     async def work_one(self, task: dict) -> None:
         self.task_id, self.lease_id, self.cancel_reason = task["task_id"], task["lease_id"], None
+        self.resume = task.get("resume") if self.can_resume else None
+        self.gen_lease, self.ckpt_epoch = self.lease_id, self.ckpt_epoch + 1
+        self.gen_pieces = [self.resume["text"]] if self.resume else []
+        self.gen_tokens = self.resume["tokens"] if self.resume else 0
+        self.ckpt_acked = len(self.resume["text"]) if self.resume else 0
+        if self.resume:
+            self.log("»", f"chunk #{task['chunk_index']} resumes at token {self.gen_tokens} (Baton relay)")
         base = {"worker_id": self.worker_id, "task_id": self.task_id, "lease_id": self.lease_id}
         self.inference = asyncio.create_task(self.infer(task["prompt"]))
         try:
@@ -441,7 +583,8 @@ class PreemptibleEdgeWorker:
                 return
             result, tps = self.inference.result()
             await self.refresh_model_size()  # the model is certainly loaded right now
-            r = await self.report("/worker/complete", {**base, "result": result, "tokens_per_sec": round(tps, 1)})
+            r = await self.report("/worker/complete", {**base, "result": result, "tokens_per_sec": round(tps, 1),
+                                                       "gen_tokens": self.gen_tokens})
             if r is not None and r.status_code == 409:
                 self.log("~", f"chunk #{task['chunk_index']} result discarded: lease lost (already re-issued)")
             elif r is not None and r.status_code >= 500:

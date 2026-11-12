@@ -56,6 +56,7 @@ from pydantic import BaseModel, Field
 
 from discovery import DISCOVERY_PORT, DiscoveryResponder, default_advertise_url
 from graphrag import ExtractionError, GraphSink, JsonlGraphSink, NullSink, normalize_extraction
+from relay import MAX_CKPT_CHARS
 from grid_auth import (CLIENT_TOKEN_ENV, WORKER_TOKEN_ENV, GridAuthError, credential_worker_id, resolve_token,
                        verify_worker_credential)
 from grid_tls import TLSConfigError, cert_sans, default_sans, ensure_self_signed, fingerprint_file
@@ -66,6 +67,7 @@ HEARTBEAT_INTERVAL_SECONDS = 3.0
 WORKER_TIMEOUT_SECONDS = 12.0
 REAPER_INTERVAL_SECONDS = 0.5
 MAX_FAILURES = 3
+MAX_HOPS = 16            # relay-ledger entries kept per task
 MAX_EVENTS = 2000
 MAX_CHUNKS_PER_JOB = 50_000
 MAX_CHUNK_CHARS = 100_000
@@ -105,6 +107,10 @@ class WorkerInfo(BaseModel):
     last_seen: float = 0.0
     # sha256 of the per-registration session secret; server-managed, never returned by status APIs.
     session_digest: Optional[str] = None
+    # Decode accounting (Baton): tokens this node generated, and how many of them were thrown away
+    # (lease ended without a result and without a checkpoint a successor could continue from).
+    tokens_generated: int = 0
+    tokens_wasted: int = 0
 
 
 class GridTask(BaseModel):
@@ -126,6 +132,18 @@ class GridTask(BaseModel):
     completed_by: Optional[str] = None
     created_at: float = 0.0
     completed_at: Optional[float] = None
+    # Baton token relay. The checkpoint is the generation-so-far; it is journaled with the task, so it
+    # survives a coordinator crash as well as a worker one.
+    ckpt_text: str = ""
+    ckpt_tokens: int = 0           # decode tokens that text represents
+    ckpt_model: str = ""           # model that produced it: only the same model may continue it
+    lease_start_tokens: int = 0    # tokens the current holder was handed (0 = from scratch)
+    lease_reported_tokens: int = 0  # holder's latest cumulative token count
+    tokens_generated: int = 0      # decode tokens burned on this task across all attempts
+    tokens_salvaged: int = 0       # tokens successors did not have to decode again
+    output_tokens: int = 0         # tokens in the accepted result
+    resumes: int = 0
+    hops: list[dict] = Field(default_factory=list)  # relay ledger (last MAX_HOPS leases)
 
 
 class Job(BaseModel):
@@ -155,7 +173,16 @@ class BatchSubmitRequest(BaseModel):
     required_tier: int = Field(1, ge=1, le=3)
 
 
-class HeartbeatRequest(BaseModel):
+class CheckpointFields(BaseModel):
+    """Baton: the holder's progress. `gen_tokens` is cumulative for this generation (a resumed
+    lease starts at the tokens it was handed). The text travels as a delta: `ckpt_delta` replaces
+    the stored checkpoint from character `ckpt_from` on, so each heartbeat only carries new text."""
+    gen_tokens: int = Field(0, ge=0)
+    ckpt_from: Optional[int] = Field(None, ge=0)
+    ckpt_delta: Optional[str] = Field(None, max_length=MAX_CKPT_CHARS)
+
+
+class HeartbeatRequest(CheckpointFields):
     worker_id: str
     task_id: Optional[str] = None
     lease_id: Optional[str] = None
@@ -165,7 +192,7 @@ class HeartbeatRequest(BaseModel):
     state: WorkerState = WorkerState.IDLE_HARVESTING
 
 
-class PreemptRequest(BaseModel):
+class PreemptRequest(CheckpointFields):
     worker_id: str
     reason: str = "user_activity"
     detected_at: Optional[float] = None  # worker wall clock when activity was seen
@@ -178,6 +205,7 @@ class TaskCompleteRequest(BaseModel):
     lease_id: str
     result: dict
     tokens_per_sec: float = 0.0
+    gen_tokens: int = Field(0, ge=0)
 
 
 class TaskFailRequest(BaseModel):
@@ -224,6 +252,7 @@ class GridState:
         lease_ttl: float = LEASE_TTL_SECONDS,
         worker_timeout: float = WORKER_TIMEOUT_SECONDS,
         max_failures: int = MAX_FAILURES,
+        relay: bool = False,
     ):
         self.sink = sink or NullSink()
         self.store = store
@@ -231,6 +260,9 @@ class GridState:
         self.lease_ttl = lease_ttl
         self.worker_timeout = worker_timeout
         self.max_failures = max_failures
+        # Baton: hand a preempted generation's partial output to the next same-model worker.
+        # Decode accounting (generated / wasted / goodput) runs either way.
+        self.relay = relay
         self.workers: dict[str, WorkerInfo] = {}
         self.tasks: dict[str, GridTask] = {}
         self.jobs: dict[str, Job] = {}
@@ -326,8 +358,36 @@ class GridState:
         task.attempts += 1
         self.leased.add(task.task_id)
         self.leases_by_worker.setdefault(worker_id, set()).add(task.task_id)
+        w = self.workers.get(worker_id)
+        usable = (self.relay and task.ckpt_tokens > 0 and bool(task.ckpt_text) and w is not None
+                  and w.model_name == task.ckpt_model)
+        task.lease_start_tokens = task.ckpt_tokens if usable else 0
+        task.lease_reported_tokens = task.lease_start_tokens
+        if usable:
+            task.resumes += 1
+            task.tokens_salvaged += task.ckpt_tokens
+            prev = list(dict.fromkeys(h["worker"] for h in task.hops)) or ["?"]
+            self.log("RELAY_RESUME", f"Chunk #{task.chunk_index} -> {worker_id} resumes at token {task.ckpt_tokens} "
+                     f"(decoded so far by {', '.join(prev)})", task, worker_id, resume_tokens=task.ckpt_tokens)
 
     def _unlease(self, task: GridTask) -> None:
+        # Every way a lease ends (complete / preempt / expiry / fail / re-register) funnels through here.
+        if task.assigned_worker:
+            new = max(0, task.lease_reported_tokens - task.lease_start_tokens)
+            done = task.completed_at is not None and task.completed_by == task.assigned_worker
+            # Tokens a successor can continue from are not wasted (if the checkpoint is later dropped,
+            # they are counted then - see _drop_checkpoint).
+            saved = new if done else max(0, min(task.lease_reported_tokens,
+                                                 task.ckpt_tokens if self.relay else 0) - task.lease_start_tokens)
+            task.tokens_generated += new
+            task.hops = (task.hops + [{"worker": task.assigned_worker, "start": task.lease_start_tokens,
+                                       "end": task.lease_reported_tokens, "completed": done}])[-MAX_HOPS:]
+            w = self.workers.get(task.assigned_worker)
+            if w:
+                w.tokens_generated += new
+                w.tokens_wasted += new - saved
+                self._dirty_workers.add(w.worker_id)
+            task.lease_start_tokens = task.lease_reported_tokens = 0
         self.leased.discard(task.task_id)
         holder = self.leases_by_worker.get(task.assigned_worker or "")
         if holder:
@@ -336,6 +396,37 @@ class GridState:
         task.assigned_worker = None
         task.lease_id = None
         task.lease_expires_at = 0.0
+        self._dirty_tasks.add(task.task_id)
+
+    def _absorb(self, task: GridTask, cp: CheckpointFields) -> bool:
+        """Take the current holder's progress report. Returns whether the checkpoint delta was
+        stored. Callers have already checked the lease, so a zombie can never write here."""
+        task.lease_reported_tokens = max(task.lease_reported_tokens, cp.gen_tokens)
+        if not self.relay or cp.ckpt_delta is None or cp.ckpt_from is None:
+            return False
+        if cp.ckpt_from > len(task.ckpt_text):
+            return False  # a gap: the worker resends from its last acknowledged offset
+        text = task.ckpt_text[:cp.ckpt_from] + cp.ckpt_delta
+        if text == task.ckpt_text:
+            return False  # nothing new (already acknowledged)
+        if len(text) > MAX_CKPT_CHARS or len(text) < len(task.ckpt_text):
+            return False  # only progress replaces a checkpoint (a rolled-back resume catches up first)
+        w = self.workers.get(task.assigned_worker or "")
+        task.ckpt_text, task.ckpt_tokens = text, max(cp.gen_tokens, task.lease_start_tokens)
+        task.ckpt_model = w.model_name if w else ""
+        self._dirty_tasks.add(task.task_id)
+        return True
+
+    def _drop_checkpoint(self, task: GridTask) -> None:
+        """An attempt failed validation and may have been steered wrong by its prefix: never reuse it.
+        Tokens that were only 'saved' by this checkpoint become waste of the workers who decoded them."""
+        if task.ckpt_tokens:
+            for h in task.hops:
+                if not h.get("completed") and h["worker"] in self.workers:
+                    kept = max(0, min(h["end"], task.ckpt_tokens) - h["start"])
+                    self.workers[h["worker"]].tokens_wasted += kept
+                    self._dirty_workers.add(h["worker"])
+        task.ckpt_text, task.ckpt_tokens, task.ckpt_model = "", 0, ""
         self._dirty_tasks.add(task.task_id)
 
     def _enqueue(self, task: GridTask, *, front: bool) -> None:
@@ -491,8 +582,11 @@ class GridState:
             if lease_valid:
                 task.lease_expires_at = now + self.lease_ttl
                 w.current_task_id = task.task_id
+                if self._absorb(task, hb):
+                    self._flush()  # journal the checkpoint: it must survive a coordinator crash too
         # Tell the worker if its lease is gone so it can stop burning compute on zombie work.
-        return {"ok": True, "lease_valid": lease_valid}
+        return {"ok": True, "lease_valid": lease_valid,
+                "ckpt_len": len(task.ckpt_text) if lease_valid and self.relay else None}
 
     @mutation
     def preempt(self, req: PreemptRequest) -> int:
@@ -511,6 +605,7 @@ class GridState:
         for task in self._worker_leases(req.worker_id):
             if req.lease_id is not None and task.lease_id != req.lease_id:
                 continue
+            self._absorb(task, req)  # the exact text at the moment of yield (rides the POST we send anyway)
             task.preemptions += 1
             self._requeue(task)
             reclaimed += 1
@@ -552,6 +647,9 @@ class GridState:
         task.result = {**extraction, "_lease_id": req.lease_id}
         task.completed_by = req.worker_id
         task.completed_at = now
+        task.lease_reported_tokens = max(task.lease_reported_tokens, req.gen_tokens)
+        task.output_tokens = task.lease_reported_tokens
+        task.ckpt_text = ""  # the result is the record now
         if w:
             w.completed_count += 1
             w.tokens_per_sec = req.tokens_per_sec
@@ -568,6 +666,7 @@ class GridState:
         self._fail(self._get_lease(req.worker_id, req.task_id, req.lease_id), req.worker_id, req.error)
 
     def _fail(self, task: GridTask, worker_id: str, error: str) -> None:
+        self._drop_checkpoint(task)
         w = self.workers.get(worker_id)
         if w:
             w.failed_count += 1
@@ -636,6 +735,8 @@ class GridState:
             "total_failures": sum(t.failures for t in tasks),
             "failed_chunks": [{"chunk_index": t.chunk_index, "error": t.last_error} for t in tasks if t.state == TaskState.FAILED],
         }
+        out["relay"] = {"resumes": sum(t.resumes for t in tasks), "tokens_generated": sum(t.tokens_generated for t in tasks),
+                        "tokens_in_results": sum(t.output_tokens for t in tasks if t.state == TaskState.COMPLETED)}
         if include_results:
             out["results"] = [{"chunk_index": t.chunk_index, "worker_id": t.completed_by,
                                **{k: v for k, v in (t.result or {}).items() if not k.startswith("_")}} for t in tasks]
@@ -649,10 +750,30 @@ class GridState:
             "jobs": [self._job_summary(self.jobs[j]) for j in list(self.jobs)[-5:]],
             "events": [f"[{time.strftime('%H:%M:%S', time.localtime(e.ts))}] {e.kind}: {e.msg}" for e in list(self.events)[-14:]],
         }
+        out["relay"] = self.relay_stats()
         stats = getattr(self.sink, "stats", None)
         if callable(stats):  # e.g. Qdrant queue/spool depth: lets operators see a lagging index
             out["sink"] = stats()
         return out
+
+    def relay_stats(self) -> dict:
+        """Grid-wide decode accounting. goodput = tokens in accepted results / tokens decoded."""
+        generated = output = salvaged = resumes = inflight = relayed = 0
+        for t in self.tasks.values():
+            generated += t.tokens_generated
+            salvaged += t.tokens_salvaged
+            resumes += t.resumes
+            if t.state == TaskState.COMPLETED:
+                output += t.output_tokens
+                relayed += t.resumes > 0
+            elif t.state == TaskState.LEASED:
+                inflight += max(0, t.lease_reported_tokens - t.lease_start_tokens)
+        return {
+            "enabled": self.relay, "tokens_generated": generated, "tokens_in_results": output,
+            "tokens_salvaged": salvaged, "tokens_inflight": inflight, "resumes": resumes, "relayed_chunks": relayed,
+            "goodput_pct": round(100.0 * output / generated, 1) if generated else None,
+            "wasted_by_worker": {w.worker_id: w.tokens_wasted for w in self.workers.values() if w.tokens_wasted},
+        }
 
     def check_invariants(self) -> None:
         """Expensive consistency check of every index against the task table (tests / debugging)."""
@@ -809,7 +930,7 @@ def create_app(state: GridState | None = None, worker_token: str | None = None,
             raise HTTPException(status_code=409, detail=f"worker_id {info.worker_id} is held by a live worker; "
                                 f"it frees up when that worker shuts down or misses heartbeats")
         return {"status": "registered", "session": session, "lease_ttl": grid.lease_ttl,
-                "heartbeat_interval": HEARTBEAT_INTERVAL_SECONDS}
+                "heartbeat_interval": HEARTBEAT_INTERVAL_SECONDS, "relay": grid.relay}
 
     @worker_api.post("/pull-task")
     async def pull_task(request: Request, worker_id: str, x_nightshift_session: Optional[str] = Header(default=None)):
@@ -820,8 +941,11 @@ def create_app(state: GridState | None = None, worker_token: str | None = None,
             raise _unknown(worker_id)
         if not task:
             return {"task": None}
-        return {"task": {"task_id": task.task_id, "lease_id": task.lease_id, "job_id": task.job_id,
-                         "chunk_index": task.chunk_index, "prompt": task.prompt, "lease_ttl": grid.lease_ttl}}
+        out = {"task_id": task.task_id, "lease_id": task.lease_id, "job_id": task.job_id,
+               "chunk_index": task.chunk_index, "prompt": task.prompt, "lease_ttl": grid.lease_ttl}
+        if task.lease_start_tokens:  # Baton: continue this generation instead of starting over
+            out["resume"] = {"text": task.ckpt_text, "tokens": task.lease_start_tokens}
+        return {"task": out}
 
     @worker_api.post("/heartbeat")
     async def worker_heartbeat(request: Request, hb: HeartbeatRequest, x_nightshift_session: Optional[str] = Header(default=None)):
@@ -1037,6 +1161,9 @@ def main(argv: list[str] | None = None) -> None:
                         "bind, shared on loopback")
     p.add_argument("--trusted-host", action="append", default=[], metavar="NAME",
                    help="extra hostname accepted in Host/Origin headers (repeatable; loopback names always allowed)")
+    p.add_argument("--relay", action=argparse.BooleanOptionalAction, default=False,
+                   help="Baton token relay: a preempted chunk continues from its partial output on the next "
+                        "same-model worker instead of restarting (decode accounting is always on)")
     t = p.add_argument_group("TLS (required for a non-loopback bind unless --allow-plaintext)")
     t.add_argument("--tls-cert", default=None, help="PEM certificate (chain) file")
     t.add_argument("--tls-key", default=None, help="PEM private key file (mode 0600)")
@@ -1153,7 +1280,9 @@ def main(argv: list[str] | None = None) -> None:
 
     sink = _build_sink(a)
     store = None if a.db.lower() == "none" else GridStore(a.db)
-    grid = GridState(sink=sink, store=store)
+    grid = GridState(sink=sink, store=store, relay=a.relay)
+    if a.relay:
+        print("[coordinator] Baton token relay: ON (preempted chunks resume from their partial output)", file=sys.stderr)
     trusted = set(a.trusted_host)
     if not _is_loopback(a.host) and a.host not in ("0.0.0.0", "::"):
         trusted.add(a.host)
