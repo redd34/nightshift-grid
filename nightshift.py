@@ -47,7 +47,19 @@ from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_STATE_DIR = Path(os.environ.get("NIGHTSHIFT_STATE_DIR", HERE / ".nightshift"))
+# A source checkout keeps its state next to the code (as before); an installed copy (uv tool / pipx)
+# lives in site-packages, which is no place for tokens and databases, so it uses ~/.nightshift.
+IS_CHECKOUT = (HERE / "pyproject.toml").exists()
+DEFAULT_STATE_DIR = Path(os.environ.get("NIGHTSHIFT_STATE_DIR",
+                                        HERE / ".nightshift" if IS_CHECKOUT else Path.home() / ".nightshift"))
+
+
+def _version() -> str:
+    try:
+        from importlib.metadata import version
+        return version("nightshift-grid")
+    except Exception:
+        return "0.1.0+source"
 DEFAULT_MODEL = "qwen3:4b"
 DEFAULT_PORT = 8000
 DEFAULT_OLLAMA = "http://127.0.0.1:11434"
@@ -224,11 +236,34 @@ def terminate_tree(pids: Iterable[int], timeout: float, sig: int = signal.SIGTER
             p.send_signal(sig)
         except psutil.Error:
             pass
-    _, alive = psutil.wait_procs(list(procs.values()), timeout=timeout)
+    alive = _wait_gone(list(procs.values()), timeout)
     for p in alive:
         _signal(p, signal.SIGKILL if hasattr(signal, "SIGKILL") else signal.SIGTERM)
-    psutil.wait_procs(alive, timeout=5)
+    _wait_gone(alive, 5)
     return [p.pid for p in alive]
+
+
+def _wait_gone(procs: list, timeout: float) -> list:
+    """Wait until every process has exited; return the ones still running at `timeout`.
+
+    A process that has exited but not been reaped yet (a zombie) counts as gone: when `down` runs
+    in a separate process from `up`, `up` is the parent and only it can reap them, so waiting for
+    a zombie to disappear would wait the whole timeout and then "force-kill" a process that had
+    already shut down cleanly. psutil.wait_procs still reaps the ones that are our own children."""
+    import psutil
+
+    def running(p) -> bool:
+        try:
+            return p.is_running() and p.status() != psutil.STATUS_ZOMBIE
+        except psutil.Error:
+            return False
+
+    deadline = time.monotonic() + timeout
+    pending = [p for p in procs if running(p)]
+    while pending and time.monotonic() < deadline:
+        _, still = psutil.wait_procs(pending, timeout=min(0.2, max(0.0, deadline - time.monotonic())))
+        pending = [p for p in still if running(p)]
+    return pending
 
 
 def _signal(p, sig: int) -> None:
@@ -454,6 +489,8 @@ def cmd_up(a: argparse.Namespace) -> int:
               f"({'mock' if a.mock else a.model}); logs in {_display(state.logs)}/\n{tips}\n", flush=True)
 
         def coordinator_dead() -> bool:
+            for c in sup.workers:  # reap workers that exited (e.g. stopped by `down`): no zombies
+                c.proc.poll()
             return sup.coordinator.proc.poll() is not None
 
         if a.no_dashboard:
@@ -665,8 +702,9 @@ def cmd_token(a: argparse.Namespace) -> int:
 
 # --------------------------------------------------------------------------- argument parsing
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="nightshift.py", description="Nightshift Grid single-command CLI",
+    ap = argparse.ArgumentParser(prog="nightshift", description="Nightshift Grid single-command CLI",
                                  allow_abbrev=False)
+    ap.add_argument("--version", action="version", version=f"nightshift-grid {_version()}")
     sub = ap.add_subparsers(dest="command", required=True, metavar="{up,submit,status,chaos-test,token,down}")
 
     def state_arg(p):

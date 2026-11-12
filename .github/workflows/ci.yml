@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - run: python -m pyflakes *.py tests/*.py scripts/*.py
+      - run: python -m pytest -q tests
+
+  chaos:
+    name: chaos benchmark (mock, phases 1-3)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e .
+      - run: python chaos_test.py --mock --phases 1,2,3 --markdown
+      - run: python chaos_test.py --mock --relay --phases 1,2,3 --report chaos_report_relay.json
+
+  package:
+    name: install as a tool and run a grid
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+      - run: uv tool install .
+      - run: nightshift --version
+      - name: up / submit / status / down
+        env:
+          NIGHTSHIFT_STATE_DIR: ${{ runner.temp }}/ns
+        run: |
+          nightshift up --mock --workers 2 --no-dashboard --allow-battery > up.log 2>&1 &
+          for i in $(seq 1 60); do nightshift status >/dev/null 2>&1 && break; sleep 1; done
+          nightshift submit --wait --timeout 180
+          nightshift status
+          nightshift down
+          cat up.log

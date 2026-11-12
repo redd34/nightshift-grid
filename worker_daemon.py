@@ -851,5 +851,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return a
 
 
-if __name__ == "__main__":
+def main() -> None:
     asyncio.run(_amain(parse_args()))
+
+
+if __name__ == "__main__":
+    main()

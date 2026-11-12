@@ -252,3 +252,25 @@ def test_port_free_detects_listener():
 def test_status_without_coordinator_is_clean_error(tmp_path, capsys):
     assert ns.main(["status", "--state-dir", str(tmp_path), "--coordinator", "http://127.0.0.1:9"]) == 2
     assert "nightshift.py up" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(os.name != "posix", reason="zombies are a POSIX concept")
+def test_wait_gone_treats_unreaped_zombies_as_exited():
+    """`down` runs in a different process than `up`, so a worker that exited cleanly stays a zombie
+    until `up` reaps it. That must count as gone, not trigger a 10 s wait and a bogus force-kill."""
+    code = ("import subprocess,sys,time;p=subprocess.Popen([sys.executable,'-c','pass']);"
+            "print(p.pid,flush=True);time.sleep(30)")  # never waits on p -> p becomes a zombie
+    parent = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+    try:
+        zpid = int(parent.stdout.readline())
+        z = psutil.Process(zpid)
+        for _ in range(50):
+            if z.status() == psutil.STATUS_ZOMBIE:
+                break
+            time.sleep(0.05)
+        start = time.monotonic()
+        assert ns._wait_gone([z], timeout=5) == []
+        assert time.monotonic() - start < 1.0
+    finally:
+        parent.kill()
+        parent.wait()
