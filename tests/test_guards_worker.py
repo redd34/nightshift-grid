@@ -114,6 +114,10 @@ def run_preempt(worker, s, settle=0.3):
 def live_worker(monkeypatch, tmp_path, *extra):
     w = make_worker(monkeypatch, tmp_path, *extra)
     w.mock = False                                          # exercise the real unload path, fake transports
+    # Hermetic: the `auto` unload policy reads host memory, so pin a roomy host (16 GB, 40% used)
+    # instead of depending on whatever else this machine is running.
+    roomy = types.SimpleNamespace(percent=40.0, available=16 * 2**30, total=32 * 2**30)
+    monkeypatch.setattr(worker_daemon.psutil, "virtual_memory", lambda: roomy)
     return w
 
 

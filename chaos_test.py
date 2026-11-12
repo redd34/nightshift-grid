@@ -122,6 +122,8 @@ class Grid:
         argv = ["coordinator.py", "--port", str(self.args.port), "--output", str(self.output), "--db", str(self.db)]
         if "--no-advertise" in coordinator_help():
             argv.append("--no-advertise")  # a throwaway test grid must not show up in LAN discovery
+        if getattr(self.args, "relay", False):
+            argv.append("--relay")
         self.spawn("coordinator", argv,
                    {"GRID_WORKER_TOKEN": self.worker_token, "GRID_CLIENT_TOKEN": self.client_token, "GRID_TOKEN": ""})
         self.wait_for(lambda: httpx.get(f"{self.url}/healthz", timeout=1).status_code == 200, 15, "coordinator up")
@@ -522,6 +524,11 @@ def build_checks(report: dict) -> dict[str, bool]:
             phases[1]["leases_issued_to_preempted_node_while_user_active"] == 0
     if 1 in phases and 2 in phases:
         checks["preempted node resumed harvesting"] = phases[2]["previously_preempted_node_resumed_chunks"] > 0
+    relay = report.get("relay") or {}
+    if relay.get("enabled"):
+        checks["relay: interrupted chunks resumed from their checkpoint"] = relay.get("resumes", 0) > 0
+        checks["relay: no resumed attempt failed (resumed output identical to uninterrupted)"] = \
+            all(p["job"]["total_failures"] <= (1 if n == 2 else 0) for n, p in phases.items())
     if 4 in phases:
         ws = phases[4]["workers"].values()
         checks["phase 4: every worker yielded with reason cpu_busy"] = all(w["preempted"] for w in ws)
@@ -615,6 +622,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--hog-max", type=float, default=20.0, help="hard cap on phase 4 hog duration, seconds")
     ap.add_argument("--hog-hold", type=float, default=3.0, help="keep the hog on this long after all workers yield")
     ap.add_argument("--resume-timeout", type=float, default=30.0, help="phase 4: wait this long for workers to resume")
+    ap.add_argument("--relay", action="store_true", help="run the grid with Baton token relay enabled")
     ap.add_argument("--report", default="chaos_report.json")
     ap.add_argument("--markdown", action="store_true", help="print a Markdown benchmark table at the end")
     ap.add_argument("--markdown-out", default=None, metavar="FILE", help="also write the Markdown table to FILE")
@@ -633,6 +641,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         for n in args.phases:
             results[n] = runners[n](g)
         g.poll_events()
+        relay = g.status().get("relay")
         hog_start = results[4].pop("_t_hog") if 4 in results else float("inf")
         jobs = [p["job"]["job_id"] for p in results.values()]
         report = {"mode": "mock" if args.mock else f"live:{args.model}", "phases": args.phases,
@@ -640,6 +649,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                   **{PHASE_KEYS[n]: p for n, p in results.items()},
                   "unintended_preemptions": unintended_preemptions(g, hog_start),
                   "output_verification": verify_output(g, jobs), "throughput": throughput(g, jobs)}
+        if relay is not None:
+            report["relay"] = relay
     finally:
         g.stop()
     report["checks"] = checks = build_checks(report)
@@ -664,6 +675,11 @@ def main(argv: Optional[list[str]] = None) -> int:
           f"duplicates={out['duplicates']}, triples={out['total_triples']}")
     print("Auth:", auth)
     print("Throughput:", report["throughput"])
+    if report.get("relay"):
+        r = report["relay"]
+        print(f"Relay: enabled={r['enabled']} resumes={r['resumes']} relayed_chunks={r['relayed_chunks']} "
+              f"tokens generated={r['tokens_generated']} in results={r['tokens_in_results']} "
+              f"salvaged={r['tokens_salvaged']} goodput={r['goodput_pct']}%")
     if report["unintended_preemptions"]:
         print("Unintended preemptions:", report["unintended_preemptions"])
     for name, ok in checks.items():

@@ -47,6 +47,10 @@ def header_text(data: dict) -> str:
     )
     if counts.get("FAILED"):
         text += f" | [red]Dead-lettered: {counts['FAILED']}[/red]"
+    relay = data.get("relay") or {}
+    if relay.get("goodput_pct") is not None:  # tokens in results / tokens decoded (Baton accounting)
+        text += (f" | Goodput: [bold]{relay['goodput_pct']:.0f}%[/bold]"
+                 + (f" (relay: {relay.get('resumes', 0)} resumes)" if relay.get("enabled") else ""))
     return text
 
 

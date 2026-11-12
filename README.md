@@ -113,6 +113,13 @@ Accessibility permission.
 | **Fail-closed idle sensing** | With `--native-idle-seconds`, a worker that can't read HID idle time refuses to start (`--allow-no-idle-sensor` overrides). Sensors: macOS `ioreg`, Windows `GetLastInputInfo`, GNOME/Wayland Mutter and freedesktop ScreenSaver over D-Bus, X11 `xprintidle`. If a sensor dies at runtime, the worker pauses (`idle_sensor_lost`) rather than guessing. |
 | **Zero-config LAN discovery** | `worker_daemon.py --discover` finds the coordinator over UDP broadcast. The reply carries an HMAC proof keyed by the worker token, so a rogue host can't impersonate the coordinator and harvest tokens. Replays fail (fresh nonce), two valid coordinators are an error, and responses are size-capped and rate-limited (not an amplifier). |
 | **Live vector index (optional)** | `--qdrant-url` adds a Qdrant sink alongside the always-on JSONL. Writes are queued off the event loop, batched, embedded (nomic-embed-text, or a deterministic hash embedder) and upserted idempotently into `nightshift_graph`. Failures spool to disk and replay, and never fail a completion. One embedder per collection is enforced. |
+| **Preemption without lost work (Baton relay, opt-in)** | With `coordinator.py --relay`, a worker streams its partial output to the coordinator as small deltas on the heartbeat it already sends, plus the exact text at the moment it yields. When a lease ends early (human returns, Wi-Fi drops, SIGKILL), the next worker on the **same model** continues the generation from that text instead of from token zero. Checkpoints are fenced by `lease_id`, only grow, and are journaled with the task, so they survive a coordinator crash too. A resumed attempt that fails validation drops the checkpoint, so a bad prefix can't loop. Live resume uses a raw prompt that's verified per model at worker startup (ChatML/Qwen today); other models restart as before. Decode accounting is always on: tokens generated, tokens in results, tokens wasted per node and goodput appear in `/v1/grid/status` → `relay`.
+
+**Live fidelity (qwen3:4b, 3 chunks × 25/50/75% cuts, 2 runs):**
+- 18/18 resumed outputs are valid; 6/18 are identical to a fresh run.
+- Mean triple overlap with the fresh run is 0.70, against 0.89 between two fresh runs.
+- So resumed extractions drift more than run-to-run noise, mainly because an ungrammared continuation sometimes closes the object early.
+- **Relay therefore stays opt-in.** It suits slow nodes and long outputs, where restarting costs most. |
 | **Resilient workers** | Non-JSON or 5xx responses are retried, not fatal. If the activity watcher or heartbeat task dies, the worker exits loudly instead of running unprotected. |
 
 ---
@@ -235,8 +242,8 @@ With tokens configured, `/worker/*` requires `Authorization: Bearer <worker cred
 | `GET /healthz` | Liveness probe (unauthenticated, reveals nothing). |
 | `POST /worker/register` | Join, or re-join. A re-join re-queues the node's old leases. |
 | `POST /worker/pull-task?worker_id=` | Lease the next chunk → `{task_id, lease_id, prompt}`. |
-| `POST /worker/heartbeat` | Extend the lease and report telemetry → `{lease_valid}`. |
-| `POST /worker/preempt` | `{worker_id, reason, detected_at, lease_id?}`: hand back the lease now. |
+| `POST /worker/heartbeat` | Extend the lease and report telemetry plus progress (`gen_tokens`, and with relay a checkpoint delta `ckpt_from`/`ckpt_delta`) → `{lease_valid, ckpt_len}`. |
+| `POST /worker/preempt` | `{worker_id, reason, detected_at, lease_id?, gen_tokens?, ckpt_from?, ckpt_delta?}`: hand back the lease now, with the final checkpoint. With relay, the next pull of that chunk carries `resume: {text, tokens}`. |
 | `POST /worker/complete` / `/worker/fail` | Fenced by `lease_id`. |
 | `POST /v1/grid/mapreduce` | Submit `{job_name, chunks[], required_tier}`. |
 | `GET /v1/grid/jobs/{id}?results=true` | Progress, attempts, preemptions, dead letters and results. |
@@ -259,6 +266,7 @@ With tokens configured, `/worker/*` requires `Authorization: Bearer <worker cred
 | `qdrant_sink.py` | Live Qdrant sink: background batching, disk spool, embedder consistency, and `backfill`. |
 | `deploy/` | Service installers and templates: macOS LaunchAgent, systemd, Windows Task Scheduler, plus a token generator. See `deploy/README.md`. |
 | `graphrag.py` | Extraction prompt, JSON schema, normalizer and idempotent JSONL sink. |
+| `relay.py` | Baton token relay helpers: JSON progress scanner and online validator, verified ChatML raw-prompt renderer, grammar-per-item structured resume. |
 | `chaos_test.py` | E2E harness with auth on: human-preemption, worker-SIGKILL and coordinator-SIGKILL phases, with zero-loss and zero-duplicate checks. |
 | `dashboard.py`, `demo_submit.py` | TUI and batch submitter. |
 

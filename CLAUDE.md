@@ -23,6 +23,7 @@ Instead of tensor-splitting a large model across slow LAN links, each node runs 
 - `grid_store.py`: SQLite (WAL) journal for coordinator crash recovery; `grid_auth.py`: worker/client bearer-token resolution + per-worker credentials (`python grid_auth.py issue`); `grid_tls.py`: self-signed cert (`--auto-tls`) + client fingerprint pinning / CA verification.
 - `ingest.py` (files → chunks → jobs + provenance manifest), `reduce_graph.py` (entity resolution, graph.json/GraphML, Qdrant sink, `query`).
 - `nightshift.py` (one-command CLI: up/down/submit/status/chaos-test/token), `mcp_server.py` (MCP tools for AI IDEs, see docs/MCP.md), `discovery.py` (HMAC-proven UDP LAN discovery), `qdrant_sink.py` (live Qdrant sink with disk spool).
+- `relay.py`: Baton token relay (`coordinator.py --relay`): preempted chunks resume from their partial output on the next same-model worker; checkpoints ride heartbeats as deltas and are journaled. Decode accounting (`/v1/grid/status` → `relay`) is always on.
 - `deploy/`: per-user worker service installers (launchd / systemd --user / Windows Task Scheduler), coordinator systemd unit, token generator.
 - Qdrant at localhost:6333 holds OTHER projects' collections: only ever write `nightshift_*` collections (enforced in code); never delete/recreate.
 - `tests/`: pytest unit tests for the coordinator state machine (fake clock), normalizer, and idle detection.
