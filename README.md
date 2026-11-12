@@ -1,6 +1,19 @@
 # Nightshift Grid ⚡️
 
+[![CI](https://github.com/redd34/nightshift-grid/actions/workflows/ci.yml/badge.svg)](https://github.com/redd34/nightshift-grid/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)
+
 **Turn idle laptops, office PCs and legacy mini-PCs into a zero-CapEx, fault-tolerant local AI batch and GraphRAG cluster.**
+
+```bash
+uv tool install git+https://github.com/redd34/nightshift-grid    # or: pipx install git+https://...
+nightshift up --mock --workers 3                                 # coordinator + 3 workers + live dashboard
+```
+
+![A 24-chunk job on three workers: a human sits down at one laptop, it yields at once, its chunk moves to another node, and the job completes](docs/demo.gif)
+
+<sub>A real (mock-inference) run recorded with `scripts/record_demo.py`. Benchmarks so far are from a single Mac; see [Known limitations](#known-limitations-and-roadmap).</sub>
 
 Nightshift Grid is a lightweight distributed compute engine ("SETI@home meets local enterprise
 MapReduce"). It harvests idle cycles across mixed local machines without slowing down the
@@ -128,28 +141,38 @@ Accessibility permission.
 
 ### 1. Install
 
+As a tool (isolated environment; puts `nightshift`, `nightshift-coordinator`, `nightshift-worker`, `nightshift-mcp`,
+`nightshift-dashboard` and `nightshift-credential` on your PATH):
+
 ```bash
-python3 -m venv .venv        # or: uv venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt pytest
-ollama pull qwen3:4b         # any small chat model works; pass it with --model
+uv tool install git+https://github.com/redd34/nightshift-grid     # or: pipx install git+https://github.com/redd34/nightshift-grid
+ollama pull qwen3:4b                                              # any small chat model works; pass it with --model
+```
+
+From a checkout (for development; every command below also works as `python <script>.py`):
+
+```bash
+git clone https://github.com/redd34/nightshift-grid && cd nightshift-grid
+python3 -m venv .venv && source .venv/bin/activate               # or: uv venv .venv
+pip install -e ".[dev]"
 ```
 
 ### 2. Try it in 30 seconds
 
 ```bash
-python nightshift.py up --mock --workers 3          # coordinator + 3 workers + live dashboard, one terminal
-python nightshift.py submit --wait                  # (second terminal) 24-chunk demo job, zero config
-python nightshift.py status                         # one-shot table; `down` cleans up a crashed session
-python nightshift.py up --model qwen3:4b            # same, with real inference
+nightshift up --mock --workers 3          # coordinator + 3 workers + live dashboard, one terminal
+nightshift submit --wait                  # (second terminal) 24-chunk demo job, zero config
+nightshift status                         # one-shot table; `down` stops the grid and cleans up a crashed session
+nightshift up --model qwen3:4b            # same, with real inference
 ```
 
-`up` keeps tokens (0600), the state DB, output and logs in `.nightshift/`, so `submit`/`status` work without flags.
+`up` keeps tokens (0600), per-worker credentials, the state DB, output and logs in a state directory (`.nightshift/`
+in a checkout, `~/.nightshift` for an installed tool, or `$NIGHTSHIFT_STATE_DIR`), so `submit`/`status` need no flags.
 
 ### 3. Verify
 
 ```bash
-python -m pytest -q tests                           # 338 tests: state machine, durability fuzz, guards, auth, MCP...
+python -m pytest -q tests                           # 379 tests: state machine, durability fuzz, guards, auth, TLS, relay, MCP...
 python nightshift.py chaos-test --mock              # 4-phase chaos benchmark, Markdown table to stdout (~2.5 min)
 python nightshift.py chaos-test --model qwen3:4b    # same, against live Ollama
 ```

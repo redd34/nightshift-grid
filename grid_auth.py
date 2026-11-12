@@ -158,7 +158,7 @@ def check_auth(response: httpx.Response, hint: str) -> None:
 
 def main(argv: Optional[list[str]] = None) -> int:
     """`python grid_auth.py issue --id node-x --out node-x.credential` (run on the coordinator host)."""
-    ap = argparse.ArgumentParser(prog="grid_auth.py", description="Issue per-worker credentials", allow_abbrev=False)
+    ap = argparse.ArgumentParser(prog=os.path.basename(sys.argv[0]) or "grid_auth.py", description="Issue per-worker credentials", allow_abbrev=False)
     sub = ap.add_subparsers(dest="cmd", required=True)
     iss = sub.add_parser("issue", help="derive a credential valid for exactly one worker id")
     iss.add_argument("--id", required=True, help="worker id the credential is bound to")

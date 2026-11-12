@@ -19,3 +19,12 @@ graph.json
 graph.graphml
 *.manifest.jsonl
 gemini-code-*.md
+
+# packaging
+build/
+dist/
+*.egg-info/
+# local-only: hackathon prototypes/datasets and launch drafts
+hackathon/
+launch/
+docs/demo.svg

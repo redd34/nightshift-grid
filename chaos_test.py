@@ -45,6 +45,8 @@ import httpx
 from demo_submit import SAMPLE_CHUNKS
 
 HERE = Path(__file__).resolve().parent
+# Reports and logs go next to the code in a checkout, else to the current directory (installed copy).
+OUT = HERE if (HERE / "pyproject.toml").exists() else Path.cwd()
 WORKERS = [("node-office-pc", 2), ("node-legacy-laptop", 1), ("node-mac-studio", 3)]
 PREEMPT_NODE, CRASH_NODE = "node-legacy-laptop", "node-office-pc"
 N = len(SAMPLE_CHUNKS)
@@ -94,9 +96,9 @@ class Grid:
     def __init__(self, args):
         self.args = args
         self.url = f"http://127.0.0.1:{args.port}"
-        self.logdir = HERE / "chaos_logs"
+        self.logdir = OUT / "chaos_logs"
         self.logdir.mkdir(exist_ok=True)
-        self.output = HERE / args.output
+        self.output = OUT / args.output
         self.db = self.logdir / "grid_state.db"
         self.worker_token = secrets.token_urlsafe(32)
         self.client_token = secrets.token_urlsafe(32)
@@ -654,7 +656,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     finally:
         g.stop()
     report["checks"] = checks = build_checks(report)
-    (HERE / args.report).write_text(json.dumps(report, indent=2))
+    (OUT / args.report).write_text(json.dumps(report, indent=2))
 
     names = {1: "Phase 1 preemption", 2: "Phase 2 worker crash", 3: "Phase 3 coordinator crash", 4: "Phase 4 CPU spike"}
     for n, p in results.items():
