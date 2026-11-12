@@ -164,13 +164,16 @@ class ChatML:
             show = (await client.post("/api/show", json={"model": model}, timeout=10.0)).json()
             if "<|im_start|>" not in (show.get("template") or ""):
                 return False
-            chat = {"model": model, "stream": False, "options": {"num_predict": 1},
+            # num_ctx must match the worker's inference requests: an unset value makes Ollama (re)load the
+            # model at its default context, which for qwen3 is 262k tokens (~40 GB).
+            opts = {"num_predict": 1, "num_ctx": 4096}
+            chat = {"model": model, "stream": False, "options": opts,
                     "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
             if think_tag:
                 chat["think"] = False
             a = (await client.post("/api/chat", json=chat, timeout=60.0)).json()
             b = (await client.post("/api/generate", timeout=60.0, json={
-                "model": model, "raw": True, "stream": False, "options": {"num_predict": 1},
+                "model": model, "raw": True, "stream": False, "options": opts,
                 "prompt": ChatML.render(system, user, "", think_tag)})).json()
             return bool(a.get("prompt_eval_count")) and a.get("prompt_eval_count") == b.get("prompt_eval_count")
         except Exception:
