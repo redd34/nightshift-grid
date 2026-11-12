@@ -1,0 +1,39 @@
+# Nightshift worker - systemd *user* unit (rendered by deploy/install_worker.sh).
+# Installed to ~/.config/systemd/user/ so it runs as the desktop user: HID idle detection
+# (xprintidle) needs that user's X session, and the worker must yield to *that* human.
+# Run `loginctl enable-linger $USER` only if it should also run while nobody is logged in
+# (it will then see no HID input at all - fine for headless boxes, wrong for shared desktops).
+[Unit]
+Description=Nightshift Grid preemptible worker (@WORKER_ID@)
+After=network-online.target
+Wants=network-online.target
+# A bad token exits non-zero on 401: allow 5 restarts per 10 min, then give up (no hot loop).
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=exec
+WorkingDirectory=@INSTALL_DIR@
+ExecStart=@EXEC_START@
+Environment=PYTHONUNBUFFERED=1
+# X display for xprintidle; override with `systemctl --user import-environment DISPLAY XAUTHORITY`.
+Environment=DISPLAY=@DISPLAY@
+Restart=on-failure
+RestartSec=@THROTTLE_SECONDS@
+# SIGTERM = graceful drain (lease handed back to the coordinator).
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+# Good-citizen scheduling (inference itself runs in Ollama; tune Ollama's unit the same way).
+Nice=10
+CPUWeight=20
+IOWeight=20
+IOSchedulingClass=idle
+@MEMORY_HIGH_LINE@
+
+# Light hardening that does not break the worker. Deliberately NO PrivateTmp: the chaos trigger
+# file is /tmp/preempt_<worker_id> and must be the host's real /tmp.
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

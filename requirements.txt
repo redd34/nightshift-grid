@@ -1,0 +1,12 @@
+# core grid (coordinator + worker)
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+httpx>=0.27.0
+psutil>=6.1.0
+pydantic>=2.9.0
+rich>=13.9.0
+# reduce / ingest stage
+qdrant-client>=1.12.0
+pypdf>=5.0.0
+# MCP server (mcp_server.py)
+mcp>=2.3

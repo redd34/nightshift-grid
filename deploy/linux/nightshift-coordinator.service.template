@@ -1,0 +1,52 @@
+# Nightshift coordinator - systemd *system* unit. See deploy/README.md for install steps.
+# Placeholders: @INSTALL_DIR@ (code + .venv, root-owned, read-only to the service),
+#               @PORT@ (default 8000).
+# Tokens live in /etc/nightshift/coordinator.env (root:nightshift, mode 0640 or root 0600):
+#   GRID_WORKER_TOKEN=...  GRID_CLIENT_TOKEN=...   (or a single GRID_TOKEN=...)
+[Unit]
+Description=Nightshift Grid coordinator
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=nightshift
+Group=nightshift
+# /var/lib/nightshift, created and chowned by systemd; holds grid_state.db + output_graph.jsonl.
+StateDirectory=nightshift
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/nightshift
+EnvironmentFile=/etc/nightshift/coordinator.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@INSTALL_DIR@/.venv/bin/python @INSTALL_DIR@/coordinator.py --host 0.0.0.0 --port @PORT@ --output /var/lib/nightshift/output_graph.jsonl --db /var/lib/nightshift/grid_state.db
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+
+# Hardening. The coordinator only needs its StateDirectory and the network.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# MemoryDenyWriteExecute is left off: libffi/ctypes callbacks in some Python wheels need W+X pages.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

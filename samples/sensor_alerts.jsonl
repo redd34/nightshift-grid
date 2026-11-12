@@ -1,0 +1,4 @@
+{"ts": "2026-11-10T02:04:11Z", "asset": "CT-7", "message": "Vibration 4.6 mm/s exceeds alarm threshold 4.2 mm/s on PLC-Node-3"}
+{"ts": "2026-11-10T02:31:40Z", "asset": "LP-2", "message": "Discharge pressure low (2.1 bar) on lubrication pump LP-2 feeding Compressor Turbine CT-7"}
+{"ts": "2026-11-10T03:15:02Z", "asset": "C-12", "message": "Overcurrent trip on conveyor C-12 motor M-12, fault code F-221 logged by PLC-Node-1"}
+{"ts": "2026-11-10T03:15:02Z", "asset": "C-12", "message": "Overcurrent trip on conveyor C-12 motor M-12, fault code F-221 logged by PLC-Node-1"}

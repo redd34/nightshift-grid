@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+.pytest_cache/
+# runtime state & outputs
+grid_state.db
+grid_state.db-*
+output_graph.jsonl
+chaos_logs/
+chaos_report*.json
+*.token
+# CLI / MCP / sink state (contains tokens, DBs, outputs)
+.nightshift/
+nightshift_out/
+*.spool*
+coordinator.env
+*.env
+.DS_Store
+graph.json
+graph.graphml
+*.manifest.jsonl

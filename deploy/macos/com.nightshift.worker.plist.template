@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Nightshift worker LaunchAgent (rendered by deploy/install_worker.sh).
+
+  Why a per-user LaunchAgent and not a LaunchDaemon: the worker's good-citizen preemption reads
+  IOKit HIDIdleTime and must yield the moment *the person at this Mac* touches it. An agent runs
+  in that user's GUI (Aqua) session, starts at login and stops at logout, so "idle" means the
+  logged-in human is idle. A LaunchDaemon runs as root outside any login session, keeps running
+  at the login window / fast-user-switch, and would harvest cycles from a session it cannot see
+  in a way that is wrong for a shared office machine. Agents also need no root to install.
+
+  The auth token is NOT in this file (plists are world-readable); it is passed by path (the worker's token-file
+  flag) pointing at a 0600 file.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>@LABEL@</string>
+
+    <key>ProgramArguments</key>
+    <array>
+@PROGRAM_ARGUMENTS@
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>@INSTALL_DIR@</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin</string>
+    </dict>
+
+    <!-- Start at login; restart only after a crash / non-zero exit (a clean SIGTERM drain stays down). -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <!-- Minimum seconds between (re)launches: a bad token (exit on 401) retries slowly instead of hot-looping. -->
+    <key>ThrottleInterval</key>
+    <integer>@THROTTLE_SECONDS@</integer>
+    <!-- Give the worker time to hand its lease back on SIGTERM before SIGKILL. -->
+    <key>ExitTimeOut</key>
+    <integer>20</integer>
+
+    <!-- Good-citizen scheduling: the daemon itself is light; inference runs inside Ollama. -->
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>LowPriorityBackgroundIO</key>
+    <true/>
+    <key>Nice</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>@LOG_FILE@</string>
+    <key>StandardErrorPath</key>
+    <string>@LOG_FILE@</string>
+</dict>
+</plist>
