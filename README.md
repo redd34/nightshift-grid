@@ -1,7 +1,7 @@
 # Nightshift Grid ⚡️
 
 [![CI](https://github.com/redd34/nightshift-grid/actions/workflows/ci.yml/badge.svg)](https://github.com/redd34/nightshift-grid/actions/workflows/ci.yml)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/redd34/nightshift-grid/blob/main/LICENSE)
 ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)
 
 **Turn idle laptops, office PCs and legacy mini-PCs into a zero-CapEx, fault-tolerant local AI batch and GraphRAG cluster.**
@@ -11,7 +11,7 @@ uv tool install git+https://github.com/redd34/nightshift-grid    # or: pipx inst
 nightshift up --mock --workers 3                                 # coordinator + 3 workers + live dashboard
 ```
 
-![A 24-chunk job on three workers: a human sits down at one laptop, it yields at once, its chunk moves to another node, and the job completes](docs/demo.gif)
+![A 24-chunk job on three workers: a human sits down at one laptop, it yields at once, its chunk moves to another node, and the job completes](https://raw.githubusercontent.com/redd34/nightshift-grid/main/docs/demo.gif)
 
 <sub>A real (mock-inference) run recorded with `scripts/record_demo.py`. Benchmarks so far are from a single Mac; see [Known limitations](#known-limitations-and-roadmap).</sub>
 
