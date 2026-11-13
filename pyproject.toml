@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nightshift-grid"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fault-tolerant local AI batch grid that harvests idle laptops and office PCs, and yields to their humans instantly"
 readme = "README.md"
 license = "Apache-2.0"
