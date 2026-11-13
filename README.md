@@ -2,13 +2,14 @@
 
 [![CI](https://github.com/redd34/nightshift-grid/actions/workflows/ci.yml/badge.svg)](https://github.com/redd34/nightshift-grid/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/redd34/nightshift-grid/blob/main/LICENSE)
+[![PyPI](https://img.shields.io/pypi/v/nightshift-grid.svg)](https://pypi.org/project/nightshift-grid/)
 ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)
 
 **Turn idle laptops, office PCs and legacy mini-PCs into a zero-CapEx, fault-tolerant local AI batch and GraphRAG cluster.**
 
 ```bash
-uv tool install git+https://github.com/redd34/nightshift-grid    # or: pipx install git+https://...
-nightshift up --mock --workers 3                                 # coordinator + 3 workers + live dashboard
+pipx install nightshift-grid     # or: uv tool install nightshift-grid
+nightshift up --mock --workers 3 # coordinator + 3 workers + live dashboard
 ```
 
 ![A 24-chunk job on three workers: a human sits down at one laptop, it yields at once, its chunk moves to another node, and the job completes](https://raw.githubusercontent.com/redd34/nightshift-grid/main/docs/demo.gif)
@@ -145,7 +146,7 @@ As a tool (isolated environment; puts `nightshift`, `nightshift-coordinator`, `n
 `nightshift-dashboard` and `nightshift-credential` on your PATH):
 
 ```bash
-uv tool install git+https://github.com/redd34/nightshift-grid     # or: pipx install git+https://github.com/redd34/nightshift-grid
+pipx install nightshift-grid      # or: uv tool install nightshift-grid; latest main: uv tool install git+https://github.com/redd34/nightshift-grid
 ollama pull qwen3:4b                                              # any small chat model works; pass it with --model
 ```
 
