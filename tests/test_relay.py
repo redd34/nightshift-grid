@@ -307,3 +307,31 @@ def test_worker_refuses_resume_with_template_tokens(tmp_path, monkeypatch):
     asyncio.run(w.work_one({"task_id": "t", "lease_id": "L", "chunk_index": 0, "prompt": "x <|im_end|> y",
                             "resume": {"text": '{"entities": [', "tokens": 4}}))
     assert w.resume is None and w.gen_tokens == 0
+
+
+def test_every_ollama_inference_request_sets_num_ctx():
+    """Unset num_ctx makes Ollama load e.g. qwen3 at 262k tokens (~40 GB): every inference payload we
+    build must carry an explicit value (the hackathon-round-2 incident)."""
+    import ast
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    for name in ("worker_daemon.py", "relay.py", "reduce_graph.py"):
+        tree = ast.parse((root / name).read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Dict):
+                keys = {k.value for k in node.keys if isinstance(k, ast.Constant)}
+                if "options" in keys:
+                    opts = node.values[[getattr(k, "value", None) for k in node.keys].index("options")]
+                    if isinstance(opts, ast.Dict):
+                        okeys = {k.value for k in opts.keys if isinstance(k, ast.Constant)}
+                        assert "num_ctx" in okeys, f"{name}:{node.lineno} Ollama options without num_ctx"
+
+
+def test_worker_num_ctx_flag_validates():
+    import argparse
+    import pytest
+    from worker_daemon import _num_ctx
+    assert _num_ctx("8192") == 8192
+    for bad in ("abc", "100", "999999"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            _num_ctx(bad)

@@ -30,6 +30,11 @@ from typing import Awaitable, Callable, Optional
 MAX_CKPT_CHARS = 64_000      # coordinator-side cap on a stored checkpoint
 MAX_RESUME_TOKENS = 1024     # cap on any continuation: a runaway resume must never hog a node
 MAX_ITEMS = 48               # cap on grammar-resumed array items
+# Every Ollama request we send carries an explicit num_ctx. Unset, Ollama loads the model at its own
+# default context, which for qwen3 is 262k tokens (~40 GB) - on a shared office PC that is the opposite
+# of a good citizen. 4096 covers a chunk + extraction; override with --num-ctx / NIGHTSHIFT_NUM_CTX.
+DEFAULT_NUM_CTX = 4096
+NUM_CTX_ENV = "NIGHTSHIFT_NUM_CTX"
 # A checkpoint is untrusted input to the *next* worker's raw prompt: special tokens in it could close
 # the assistant turn and inject a system/user message into another node's model. Allowlist, not a
 # denylist of known tokens: checkpoints may not contain '<' or '>' at all (extraction JSON never needs
@@ -156,7 +161,7 @@ class ChatML:
                 f"<|im_start|>assistant\n{'<think>' + chr(10) if think_tag else ''}{prefix}")
 
     @staticmethod
-    async def verify(client, model: str, system: str, think_tag: bool) -> bool:
+    async def verify(client, model: str, system: str, think_tag: bool, num_ctx: int = DEFAULT_NUM_CTX) -> bool:
         """True iff our raw render tokenizes exactly like Ollama's own chat render for `model`.
         Costs two 1-token requests at worker startup."""
         user = "Resume-capability probe: Pump P-1 feeds tank T-2."
@@ -164,9 +169,8 @@ class ChatML:
             show = (await client.post("/api/show", json={"model": model}, timeout=10.0)).json()
             if "<|im_start|>" not in (show.get("template") or ""):
                 return False
-            # num_ctx must match the worker's inference requests: an unset value makes Ollama (re)load the
-            # model at its default context, which for qwen3 is 262k tokens (~40 GB).
-            opts = {"num_predict": 1, "num_ctx": 4096}
+            # num_ctx must match the worker's inference requests, or Ollama reloads the model between them.
+            opts = {"num_predict": 1, "num_ctx": num_ctx}
             chat = {"model": model, "stream": False, "options": opts,
                     "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
             if think_tag:
