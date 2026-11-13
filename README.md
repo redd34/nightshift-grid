@@ -236,6 +236,7 @@ Useful worker flags:
 - `--native-idle-seconds N` pauses the worker while HID idle time is under N seconds.
 - `--unload-on-preempt auto|always|never` sends `keep_alive: 0` to free the model's RAM. `auto` only does this under memory pressure.
 - `--allow-battery`, `--min-battery-percent P`, `--ignore-thermal` and `--max-temp-c C` control the power and thermal guards.
+- `--num-ctx N` (default 4096, env `NIGHTSHIFT_NUM_CTX`) is sent with every Ollama request. It is never left unset: Ollama would otherwise load the model at its own default context, which for qwen3 is 262k tokens (~40 GB).
 - `--max-host-cpu-pct P` (default 65, 0 = off) and `--cpu-busy-samples N` control the CPU guard. `--min-free-ram-gb G` (default 2.0) controls the RAM guard.
 - `--allow-no-idle-sensor` keeps the worker running when no HID idle sensor is available.
 - `--discover` (with `--discovery-port`) finds the coordinator on the LAN, and learns its TLS fingerprint through the authenticated reply.

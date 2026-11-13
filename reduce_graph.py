@@ -32,6 +32,8 @@ import unicodedata
 import uuid
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+
+from relay import DEFAULT_NUM_CTX
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 from xml.etree import ElementTree as ET
@@ -611,11 +613,11 @@ def facts_context(graph: dict, node_ids: set[str], seeds: Iterable[str] = (), ma
     return lines
 
 
-def ask_ollama(question: str, facts: list[str], model: str, url: str) -> str:
+def ask_ollama(question: str, facts: list[str], model: str, url: str, num_ctx: int = DEFAULT_NUM_CTX) -> str:
     import httpx
 
     payload: dict = {
-        "model": model, "stream": False, "options": {"temperature": 0},
+        "model": model, "stream": False, "options": {"temperature": 0, "num_ctx": num_ctx},
         "messages": [
             {"role": "system", "content": "Answer the question using ONLY the knowledge-graph facts provided. "
                                           "Cite the chunk numbers in parentheses for every claim. If the facts "

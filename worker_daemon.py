@@ -49,7 +49,7 @@ import httpx
 import psutil
 
 from graphrag import EXTRACTION_SCHEMA, SYSTEM_PROMPT, ExtractionError, normalize_extraction
-from relay import (MAX_RESUME_TOKENS, ChatML, closable, first_json, json_done, safe_for_raw_prompt, scan_checkpoint,
+from relay import (DEFAULT_NUM_CTX, MAX_RESUME_TOKENS, NUM_CTX_ENV, ChatML, closable, first_json, json_done, safe_for_raw_prompt, scan_checkpoint,
                    structured_resume)
 from grid_auth import (TOKEN_FILE_ENV, WORKER_TOKEN_ENV, GridAuthError, bearer_headers, check_auth,
                        credential_worker_id, resolve_token)
@@ -123,6 +123,7 @@ class PreemptibleEdgeWorker:
         self.coordinator_url = (args.coordinator or DEFAULT_COORDINATOR).rstrip("/")
         self.ollama_url = args.ollama.rstrip("/")
         self.model: str = args.model
+        self.num_ctx: int = args.num_ctx
         self.mock: bool = args.mock
         self.unload_policy: str = args.unload_on_preempt
         self.hostname = platform.node()
@@ -411,7 +412,7 @@ class PreemptibleEdgeWorker:
                              f"Run `ollama pull {self.model}` or pass --model.")
         show = (await self.ollama.post("/api/show", json={"model": self.model})).json()
         self.supports_thinking = "thinking" in show.get("capabilities", [])
-        self.can_resume = await ChatML.verify(self.ollama, self.model, SYSTEM_PROMPT, self.supports_thinking)
+        self.can_resume = await ChatML.verify(self.ollama, self.model, SYSTEM_PROMPT, self.supports_thinking, self.num_ctx)
 
     async def infer(self, prompt: str) -> tuple[dict, float]:
         return await (self._infer_mock(prompt) if self.mock else self._infer_ollama(prompt))
@@ -428,7 +429,7 @@ class PreemptibleEdgeWorker:
                           append: bool, stop_at_close: bool = False) -> str:
         """Raw /api/generate stream (resume path). Leaving the loop closes the socket -> Ollama stops."""
         payload = {"model": self.model, "raw": True, "stream": True, "keep_alive": "10m", "prompt": prompt,
-                   "options": {"num_ctx": 4096, "temperature": 0.1, "num_predict": limit or MAX_RESUME_TOKENS}}
+                   "options": {"num_ctx": self.num_ctx, "temperature": 0.1, "num_predict": limit or MAX_RESUME_TOKENS}}
         if fmt is not None:
             payload["format"] = fmt
         out: list[str] = []
@@ -492,7 +493,7 @@ class PreemptibleEdgeWorker:
             "format": EXTRACTION_SCHEMA,
             "stream": True,
             "keep_alive": "10m",
-            "options": {"num_ctx": 4096, "temperature": 0.1, "num_predict": 4 * MAX_RESUME_TOKENS},
+            "options": {"num_ctx": self.num_ctx, "temperature": 0.1, "num_predict": 4 * MAX_RESUME_TOKENS},
         }
         if self.supports_thinking:
             payload["think"] = False  # reasoning tokens are wasted work for extraction
@@ -754,6 +755,16 @@ async def _amain(args: argparse.Namespace) -> None:
         raise SystemExit(1)  # already logged where it was detected
 
 
+def _num_ctx(value) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"num_ctx must be an integer, got {value!r}")
+    if not 512 <= n <= 131072:
+        raise argparse.ArgumentTypeError(f"num_ctx must be between 512 and 131072, got {n}")
+    return n
+
+
 def _percent(value: str) -> float:
     v = float(value)
     if not 0 < v <= 100:
@@ -811,6 +822,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="UDP port for --discover (default 47474; must match the coordinator's)")
     p.add_argument("--ollama", default="http://127.0.0.1:11434")
     p.add_argument("--model", default=os.environ.get("GRID_MODEL", "qwen2.5:3b"))
+    p.add_argument("--num-ctx", type=_num_ctx, default=os.environ.get(NUM_CTX_ENV, DEFAULT_NUM_CTX), metavar="N",
+                   help=f"Context window sent with every Ollama request (default {DEFAULT_NUM_CTX}, env {NUM_CTX_ENV}). "
+                        "Always explicit: unset, Ollama loads e.g. qwen3 at 262k tokens (~40 GB)")
     p.add_argument("--tier", type=int, choices=(1, 2, 3), default=None, help="Override capability tier")
     p.add_argument("--mock", action="store_true", help="Simulated token stream (no Ollama needed)")
     p.add_argument("--native-idle-seconds", type=float, default=None, metavar="N",
