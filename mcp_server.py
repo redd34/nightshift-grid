@@ -628,11 +628,21 @@ def _job_view(st: dict) -> dict:
             "failures": st.get("total_failures"), "failed_chunks": st.get("failed_chunks", [])[:50]}
 
 
+def _package_version() -> str:
+    try:
+        from importlib.metadata import version
+        return version("nightshift-grid")
+    except Exception:  # running from a checkout that was never pip-installed
+        return "0.0.0+checkout"
+
+
 def build_server(cfg: Config, transport: httpx.AsyncBaseTransport | None = None) -> MCPServer:
     """Build the MCP server. `transport` lets tests point the client at an in-process coordinator."""
     grid = GridClient(cfg, transport)
     server = MCPServer(
         name="nightshift-grid",
+        version=_package_version(),
+        website_url="https://github.com/redd34/nightshift-grid",
         instructions=(
             "Nightshift Grid runs small local LLMs on idle machines to extract entity/relationship triples "
             "from text in parallel. Use ingest_directory_to_graph to build a knowledge graph from local docs, "

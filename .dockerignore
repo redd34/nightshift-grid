@@ -1,0 +1,11 @@
+.git
+.venv
+.nightshift
+build
+dist
+*.egg-info
+hackathon
+launch
+docs
+tests
+__pycache__
