@@ -1,6 +1,6 @@
 {
   "name": "nightshift-grid",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Turn a folder of local documents into a cited knowledge graph using small Ollama models on idle machines. Adds the nightshift MCP server and a skill that teaches Claude when and how to use it.",
   "author": { "name": "redd34", "url": "https://github.com/redd34" },
   "homepage": "https://github.com/redd34/nightshift-grid",
