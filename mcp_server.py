@@ -84,6 +84,30 @@ SECRET_FILE_PATTERNS = (
 # --------------------------------------------------------------------------- configuration
 
 
+def _endpoint_from_env_or_session() -> tuple[str, str | None]:
+    """(coordinator URL, client token file). Explicit env wins. Otherwise use what `nightshift up`
+    recorded in its state dir (NIGHTSHIFT_STATE_DIR, else ~/.nightshift for an installed copy), so a
+    grid started with `nightshift up` works with an MCP registration that sets nothing at all."""
+    url = os.environ.get("NIGHTSHIFT_URL")
+    token_file = os.environ.get("NIGHTSHIFT_TOKEN_FILE") or None
+    if url is None and token_file is None and not any(os.environ.get(e) for e in TOKEN_ENV):
+        try:
+            from nightshift import DEFAULT_STATE_DIR, StateDir
+            state = StateDir(DEFAULT_STATE_DIR)
+            session = state.read_session() or {}
+            if session.get("url"):
+                url = session["url"]
+                if state.token_path("client").is_file():
+                    token_file = str(state.token_path("client"))
+                if session.get("ca_file"):
+                    from grid_tls import CA_FILE_ENV, FINGERPRINT_ENV
+                    if not (os.environ.get(CA_FILE_ENV) or os.environ.get(FINGERPRINT_ENV)):
+                        os.environ[CA_FILE_ENV] = session["ca_file"]
+        except Exception:  # no recorded grid (or an unreadable one): fall back to the default URL
+            pass
+    return (url or DEFAULT_URL).rstrip("/"), token_file
+
+
 @dataclass(frozen=True)
 class Config:
     """Everything the tools need, resolved once from the environment at startup.
@@ -108,9 +132,10 @@ class Config:
         cwd = (cwd or Path.cwd()).resolve()
         roots, notes = parse_roots(os.environ.get("NIGHTSHIFT_MCP_ROOTS"), cwd)
         embed = os.environ.get("NIGHTSHIFT_EMBED_MODEL", "").strip()
+        url, token_file = _endpoint_from_env_or_session()
         return cls(
-            coordinator_url=os.environ.get("NIGHTSHIFT_URL", DEFAULT_URL).rstrip("/"),
-            token_file=os.environ.get("NIGHTSHIFT_TOKEN_FILE") or None,
+            coordinator_url=url,
+            token_file=token_file,
             roots=roots,
             root_notes=notes,
             out_dir=Path(os.environ.get("NIGHTSHIFT_OUT_DIR") or cwd / "nightshift_out").expanduser().resolve(),
