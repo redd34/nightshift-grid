@@ -90,7 +90,7 @@ It returns at most 25 matched entities. For those, it returns facts like this:
 
 | variable | default | purpose |
 |---|---|---|
-| `NIGHTSHIFT_URL` | `http://127.0.0.1:8000` | Coordinator base URL |
+| `NIGHTSHIFT_URL` | the grid `nightshift up` recorded, else `http://127.0.0.1:8000` | Coordinator base URL. When this, `NIGHTSHIFT_TOKEN_FILE` and the token variables are all unset, the server reads `session.json` and `client.token` from the `nightshift up` state dir (`NIGHTSHIFT_STATE_DIR`, else `~/.nightshift` for an installed copy), so a registration with no settings just works. |
 | `NIGHTSHIFT_TOKEN_FILE` | – | File holding the coordinator's **client** token (preferred) |
 | `GRID_CLIENT_TOKEN` / `GRID_TOKEN` / `NIGHTSHIFT_TOKEN` | – | Client token from the environment, used when no token file is given. The precedence follows `grid_auth.CLIENT_TOKEN_ENV`, with `NIGHTSHIFT_TOKEN` appended. |
 | `NIGHTSHIFT_MCP_ROOTS` | server CWD | Directories the tools may read, separated by `os.pathsep` (`:` on macOS/Linux, `;` on Windows) |

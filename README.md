@@ -206,10 +206,23 @@ and it never deletes or recreates a collection.
 
 ### 6. Drive it from an AI IDE (MCP)
 
-```bash
-claude mcp add nightshift --env NIGHTSHIFT_URL=http://127.0.0.1:8000 --env NIGHTSHIFT_MCP_ROOTS="$PWD" \
-    -- "$PWD/.venv/bin/python" "$PWD/mcp_server.py"
+**Claude Code plugin** (MCP server + a skill that teaches Claude when and how to use it):
+
 ```
+/plugin install nightshift-grid --marketplace redd34/nightshift-grid
+```
+
+Needs `nightshift-mcp` on your PATH (`pipx install nightshift-grid`). With no settings, the server finds the grid that
+`nightshift up` started (URL and client token from its state dir) and lets Claude read files under the project directory.
+
+**Any MCP client, by hand:**
+
+```bash
+claude mcp add nightshift -- nightshift-mcp          # optional: -e NIGHTSHIFT_MCP_ROOTS=/abs/docs:/abs/project
+```
+
+The skill on its own lives in [`skills/nightshift-grid/SKILL.md`](skills/nightshift-grid/SKILL.md); copy it to
+`~/.claude/skills/` if you register the server yourself.
 
 The server exposes 4 tools: `grid_status`, `dispatch_mapreduce_text`, `ingest_directory_to_graph` and `query_local_graph`.
 File access is limited to `NIGHTSHIFT_MCP_ROOTS` (symlinks resolved, secret files refused), and tools warn when data
