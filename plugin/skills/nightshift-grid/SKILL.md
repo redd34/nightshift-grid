@@ -1,6 +1,6 @@
 ---
 name: nightshift-grid
-description: Turn a folder of local documents into a cited knowledge graph using Nightshift Grid, which runs small local models (Ollama) on idle machines, and answer questions from it. Use when the user wants to extract entities and relationships from many local files (docs, notes, manuals, tickets, logs, contracts), build a GraphRAG-style graph without sending data to a cloud API, ask "what do these documents say about X" with chunk citations, or check the status of their Nightshift grid. Requires the nightshift MCP tools (grid_status, ingest_directory_to_graph, query_local_graph, dispatch_mapreduce_text).
+description: Turn a folder of local documents into a cited knowledge graph using Nightshift Grid, which runs small local models (Ollama) on idle machines, and answer questions from it. Use when the user wants to extract entities and relationships from many local files (docs, notes, manuals, tickets, logs, contracts), build a GraphRAG-style graph without sending data to a cloud API, ask "what do these documents say about X" with chunk citations, or check the status of their Nightshift grid. Uses the nightshift MCP tools (grid_status, ingest_directory_to_graph, query_local_graph, dispatch_mapreduce_text) and walks the user through installing them if they are missing.
 ---
 
 # Nightshift Grid: local knowledge graphs from a folder of documents
@@ -9,9 +9,21 @@ Nightshift Grid farms entity/relationship extraction out to idle machines, each 
 
 The MCP tools do the work. Your job is to pick the right tool, size the job sensibly, and answer from the evidence the tools return.
 
-## Before anything else: is a grid running?
+## First: are the nightshift tools connected?
 
-Call `grid_status` first.
+If there is no `grid_status` tool (no tools whose names include `grid_status`, `ingest_directory_to_graph` or `query_local_graph`), the MCP server isn't registered yet. Don't improvise a substitute; give the user this one-time setup and ask them to restart the session afterwards:
+
+```bash
+pipx install nightshift-grid               # or: uv tool install nightshift-grid
+claude mcp add nightshift -- nightshift-mcp
+nightshift up --mock                       # in another terminal: a demo grid (no model needed)
+```
+
+For real extraction instead of the demo: `ollama pull qwen3:4b`, then `nightshift up --model qwen3:4b`. With no settings, `nightshift-mcp` finds the grid that `nightshift up` started and lets Claude read files under the project directory (`-e NIGHTSHIFT_MCP_ROOTS=/abs/path` to choose other folders).
+
+## Then: is a grid running?
+
+Call `grid_status`.
 
 - **It fails to connect** → no coordinator is running. Tell the user to start one in a separate terminal and wait for it:
   - `nightshift up --mock` for a demo with no model (fake extraction, real scheduling),
