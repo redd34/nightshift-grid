@@ -2,9 +2,21 @@
   "name": "nightshift-grid",
   "version": "0.1.2",
   "description": "Turn a folder of local documents into a cited knowledge graph using small Ollama models on idle machines. A skill that teaches Claude to set up and use the Nightshift Grid MCP tools and answer with chunk citations.",
-  "author": { "name": "redd34", "url": "https://github.com/redd34" },
+  "author": {
+    "name": "redd34",
+    "url": "https://github.com/redd34"
+  },
   "homepage": "https://github.com/redd34/nightshift-grid",
   "repository": "https://github.com/redd34/nightshift-grid",
   "license": "Apache-2.0",
-  "keywords": ["mcp", "ollama", "local-llm", "graphrag", "knowledge-graph", "rag", "edge-ai"]
+  "privacyPolicyUrl": "https://github.com/redd34/nightshift-grid/blob/main/PRIVACY.md",
+  "keywords": [
+    "mcp",
+    "ollama",
+    "local-llm",
+    "graphrag",
+    "knowledge-graph",
+    "rag",
+    "edge-ai"
+  ]
 }

@@ -318,3 +318,5 @@ With tokens configured, `/worker/*` requires `Authorization: Bearer <worker cred
 - **Noisy hosts.** The default 65% CPU guard pauses workers on a busy developer machine. That's intended, but tune `--max-host-cpu-pct` for build servers.
 - **Not validated on real hardware:** thermal throttling and battery unplugging (unit-tested with fakes only), the Linux and Windows installers (rendered and inspected, but never run on those OSes), and `systemd-analyze`, `shellcheck` and `pwsh` linting.
 - **Extraction quality** from 3–4B models is unmeasured. Next: a small labelled set, plus Tier 3 verification/consensus on a sample.
+
+Privacy: Nightshift Grid collects nothing; your documents stay on your machines. See [PRIVACY.md](PRIVACY.md).
