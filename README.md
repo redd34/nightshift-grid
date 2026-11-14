@@ -221,7 +221,7 @@ Needs `nightshift-mcp` on your PATH (`pipx install nightshift-grid`). With no se
 claude mcp add nightshift -- nightshift-mcp          # optional: -e NIGHTSHIFT_MCP_ROOTS=/abs/docs:/abs/project
 ```
 
-The skill on its own lives in [`skills/nightshift-grid/SKILL.md`](skills/nightshift-grid/SKILL.md); copy it to
+The skill on its own lives in [`plugin/skills/nightshift-grid/SKILL.md`](plugin/skills/nightshift-grid/SKILL.md); copy it to
 `~/.claude/skills/` if you register the server yourself.
 
 The server exposes 4 tools: `grid_status`, `dispatch_mapreduce_text`, `ingest_directory_to_graph` and `query_local_graph`.

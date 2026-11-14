@@ -5,7 +5,7 @@
   "plugins": [
     {
       "name": "nightshift-grid",
-      "source": "./",
+      "source": "./plugin",
       "description": "Nightshift MCP server + skill: ingest a folder into a cited knowledge graph using small local models on idle machines, then answer questions from it.",
       "category": "productivity"
     }
