@@ -1,6 +1,6 @@
 {
   "name": "nightshift-grid",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Turn a folder of local documents into a cited knowledge graph using small Ollama models on idle machines. A skill that teaches Claude to set up and use the Nightshift Grid MCP tools and answer with chunk citations.",
   "author": {
     "name": "redd34",

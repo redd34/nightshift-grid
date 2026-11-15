@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nightshift-grid"
-version = "0.1.2"
+version = "0.1.3"
 description = "Fault-tolerant local AI batch grid that harvests idle laptops and office PCs, and yields to their humans instantly"
 readme = "README.md"
 license = "Apache-2.0"
@@ -48,6 +48,7 @@ nightshift = "nightshift:main"
 nightshift-coordinator = "coordinator:main"
 nightshift-worker = "worker_daemon:main"
 nightshift-mcp = "mcp_server:main"
+nightshift-grid = "mcp_server:main"  # so `uvx nightshift-grid` starts the MCP server (MCP Registry)
 nightshift-dashboard = "dashboard:main"
 nightshift-credential = "grid_auth:main"
 
