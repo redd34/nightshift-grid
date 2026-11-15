@@ -3,7 +3,8 @@ import asyncio, sys
 import pytest
 
 from graphrag import ExtractionError, normalize_extraction
-from idle_detection import ActivityMonitor, IdleSensorUnavailable, macos_idle_seconds, parse_ioreg_hid_idle
+from idle_detection import (ActivityMonitor, IdleSensorUnavailable, iokit_idle_seconds, macos_idle_seconds,
+                            parse_ioreg_hid_idle)
 
 
 def test_normalize_variants():
@@ -32,6 +33,23 @@ def test_parse_ioreg():
 def test_macos_reader_live():
     v = macos_idle_seconds()
     assert v is not None and v >= 0
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS only")
+def test_iokit_reader_matches_ioreg_live():
+    # Same registry property, so with no input in between: ioreg <= IOKit <= ioreg (the reads are
+    # ~20 ms apart). A keypress between reads resets the clock, so allow a couple of retries.
+    for _ in range(3):
+        before, v, after = macos_idle_seconds(), iokit_idle_seconds(), macos_idle_seconds()
+        assert v is not None and v >= 0
+        if before - 0.01 <= v <= after + 0.01:
+            return
+    pytest.fail(f"IOKit HIDIdleTime {v} is outside the ioreg readings [{before}, {after}]")
+
+
+def test_iokit_reader_off_macos(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert iokit_idle_seconds() is None
 
 
 def test_monitor_transitions(tmp_path):

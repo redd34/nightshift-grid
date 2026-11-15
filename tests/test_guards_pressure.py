@@ -5,6 +5,7 @@ import subprocess
 import sys
 import time
 
+import psutil
 import pytest
 
 from idle_detection import (
@@ -51,6 +52,66 @@ def test_scanner_excludes_self_and_peer_workers_but_not_other_python(tmp_path):
         for p in procs:
             p.kill()
             p.wait()
+
+
+def _sleeper(path, seconds=30):
+    path.write_text(f"import time\ntime.sleep({seconds})\n")
+    return subprocess.Popen([sys.executable, str(path)])
+
+
+def test_scanner_sees_new_and_exited_processes_between_full_scans(tmp_path):
+    scanner = GridProcessScanner(full_scan_s=3600)
+    assert os.getpid() in scanner() and scanner.full_scans == 1
+    peer = _sleeper(tmp_path / "worker_daemon.py")
+    try:
+        time.sleep(0.3)
+        assert peer.pid in scanner()                         # a peer that started after the full scan
+    finally:
+        peer.kill()
+        peer.wait()
+    assert peer.pid not in scanner()                         # and one that exited
+    assert scanner.full_scans == 1                           # all without re-walking the process table
+
+
+def test_scanner_between_full_scans_never_walks_the_process_table(monkeypatch):
+    scanner = GridProcessScanner(full_scan_s=3600)
+    scanner()
+
+    def boom(*a, **k):
+        raise AssertionError("process_iter called on the cheap path")
+    monkeypatch.setattr(psutil, "process_iter", boom)
+    for _ in range(3):
+        assert os.getpid() in scanner()
+
+
+def test_scanner_full_rescan_interval():
+    now = [0.0]
+    scanner = GridProcessScanner(full_scan_s=30, clock=lambda: now[0])
+    scanner()
+    now[0] = 29.9
+    scanner()
+    assert scanner.full_scans == 1
+    now[0] = 30.0
+    scanner()
+    assert scanner.full_scans == 2
+
+
+@pytest.mark.parametrize("settle_s,reclassified", [(60.0, True), (0.0, False)])
+def test_scanner_reclassifies_young_processes(tmp_path, monkeypatch, settle_s, reclassified):
+    """Right after fork a child still has its parent's name, so a young process's verdict is not
+    trusted until it is `settle_s` old; a settled one waits for the next full scan."""
+    import idle_detection
+    other = _sleeper(tmp_path / "build_job.py")
+    try:
+        time.sleep(0.3)
+        scanner = GridProcessScanner(full_scan_s=3600, settle_s=settle_s)
+        assert other.pid not in scanner()
+        # The process now "looks like" an inference server (as if it had just exec'd llama-server).
+        monkeypatch.setattr(idle_detection, "is_inference_process", lambda name: name.lower().startswith("python"))
+        assert (other.pid in scanner()) is reclassified
+    finally:
+        other.kill()
+        other.wait()
 
 
 # ---------------------------------------------------------------- CPU: priming / startup

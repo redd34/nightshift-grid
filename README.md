@@ -68,8 +68,9 @@ until the response finishes. A second trap is checking for user activity only wh
 arrives. That leaves a blind spot while the model is loading weights or evaluating a long prompt.
 
 Nightshift runs inference in its own asyncio task. An out-of-band activity watcher polls the
-chaos trigger file every 100ms and OS HID idle time every 500ms: `ioreg -c IOHIDSystem` on macOS,
-`GetLastInputInfo` on Windows, `xprintidle` on Linux. On activity it calls `task.cancel()`,
+chaos trigger file every 100ms and OS HID idle time every 500ms: IOKit `HIDIdleTime` read in-process
+on macOS (`ioreg -c IOHIDSystem` as a fallback), `GetLastInputInfo` on Windows, D-Bus or `xprintidle`
+on Linux. On activity it calls `task.cancel()`,
 which unwinds `async with client.stream(...)` and closes the connection, so Ollama stops
 generating.
 
@@ -104,7 +105,7 @@ instance. Multi-machine runs are still to do.
 | **Output integrity** (4 jobs) | **96/96 records, 0 missing, 0 duplicates, 434 triples** |
 
 With `--native-idle-seconds`, detection latency is bounded by the 500ms HID poll rather than the
-100ms file poll. The HID path is covered by unit tests and a live `ioreg` read. An end-to-end
+100ms file poll. The HID path is covered by unit tests and live IOKit and `ioreg` reads. An end-to-end
 benchmark with real keyboard input is still to do, because synthesising HID events needs macOS
 Accessibility permission.
 
@@ -123,8 +124,8 @@ Accessibility permission.
 | **Capability-aware scheduling** | A worker serves the highest tier it's capable of first, so Tier 3 nodes aren't spent on Tier 1 work while Tier 3 work waits. Recovered chunks go to the front of the queue. |
 | **Survives coordinator crashes** | Every state transition is journaled to SQLite (WAL) in one transaction. On restart, queue order, results and dead letters are recovered, and in-flight leases get a fresh TTL so workers that kept computing can still complete them. Workers retry completions for 30s to ride out the restart. About 11k durable transitions/s; a 50k-task job recovers in 0.3s. |
 | **Least-privilege auth** | Separate bearer tokens for workers (`/worker/*`) and clients (`/v1/*`), so a compromised laptop can lease work but can't submit jobs or read results. Each worker registration gets a session secret (`X-Nightshift-Session`), so a live worker's id can't be hijacked. Constant-time comparison. Tokens come from files or env, never argv. Reused token files must be regular, owned by you and 0600 (no symlinks). The coordinator binds loopback by default and refuses a LAN bind without tokens. Browser `Origin` requests are refused, and in no-auth loopback mode untrusted `Host` headers are refused too (DNS-rebinding protection). |
-| **Good citizen beyond the keyboard** | Workers also pause on battery power (`--allow-battery` to opt out) and under thermal throttling (macOS `pmset`, Linux sensors). They pause when *other* processes push host CPU over `--max-host-cpu-pct` (default 65; Ollama and co-located workers are excluded; sustain and hysteresis prevent flapping). They pause when free RAM drops under `--min-free-ram-gb` (default 2.0), evicting the model with `keep_alive: 0`; the resume threshold includes the model's size, so unloading can't cause a pause/reload loop. |
-| **Fail-closed idle sensing** | With `--native-idle-seconds`, a worker that can't read HID idle time refuses to start (`--allow-no-idle-sensor` overrides). Sensors: macOS `ioreg`, Windows `GetLastInputInfo`, GNOME/Wayland Mutter and freedesktop ScreenSaver over D-Bus, X11 `xprintidle`. If a sensor dies at runtime, the worker pauses (`idle_sensor_lost`) rather than guessing. |
+| **Good citizen beyond the keyboard** | Workers also pause on battery power (`--allow-battery` to opt out) and under thermal throttling (macOS `pmset`, Linux sensors). They pause when *other* processes push host CPU over `--max-host-cpu-pct` (default 65; Ollama and co-located workers are excluded; sustain and hysteresis prevent flapping; the full process table is walked only every 30s, with new processes picked up on every 1s poll). They pause when free RAM drops under `--min-free-ram-gb` (default 2.0), evicting the model with `keep_alive: 0`; the resume threshold includes the model's size, so unloading can't cause a pause/reload loop. |
+| **Fail-closed idle sensing** | With `--native-idle-seconds`, a worker that can't read HID idle time refuses to start (`--allow-no-idle-sensor` overrides). Sensors: macOS IOKit `HIDIdleTime` in-process (falling back to `ioreg`), Windows `GetLastInputInfo`, GNOME/Wayland Mutter and freedesktop ScreenSaver over D-Bus, X11 `xprintidle`. If a sensor dies at runtime, the worker pauses (`idle_sensor_lost`) rather than guessing. |
 | **Zero-config LAN discovery** | `worker_daemon.py --discover` finds the coordinator over UDP broadcast. The reply carries an HMAC proof keyed by the worker token, so a rogue host can't impersonate the coordinator and harvest tokens. Replays fail (fresh nonce), two valid coordinators are an error, and responses are size-capped and rate-limited (not an amplifier). |
 | **Live vector index (optional)** | `--qdrant-url` adds a Qdrant sink alongside the always-on JSONL. Writes are queued off the event loop, batched, embedded (nomic-embed-text, or a deterministic hash embedder) and upserted idempotently into `nightshift_graph`. Failures spool to disk and replay, and never fail a completion. One embedder per collection is enforced. |
 | **Preemption without lost work (Baton relay, opt-in)** | With `coordinator.py --relay`, a worker streams its partial output to the coordinator as small deltas on the heartbeat it already sends, plus the exact text at the moment it yields. When a lease ends early (human returns, Wi-Fi drops, SIGKILL), the next worker on the **same model** continues the generation from that text instead of from token zero. Checkpoints are fenced by `lease_id`, only grow, and are journaled with the task, so they survive a coordinator crash too. A resumed attempt that fails validation drops the checkpoint, so a bad prefix can't loop. Live resume uses a raw prompt that's verified per model at worker startup (ChatML/Qwen today); other models restart as before. Decode accounting is always on: tokens generated, tokens in results, tokens wasted per node and goodput appear in `/v1/grid/status` → `relay`.
