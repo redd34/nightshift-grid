@@ -828,7 +828,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--tier", type=int, choices=(1, 2, 3), default=None, help="Override capability tier")
     p.add_argument("--mock", action="store_true", help="Simulated token stream (no Ollama needed)")
     p.add_argument("--native-idle-seconds", type=float, default=None, metavar="N",
-                   help="Preempt while OS HID idle time < N seconds (macOS ioreg / Windows GetLastInputInfo / "
+                   help="Preempt while OS HID idle time < N seconds (macOS IOKit HIDIdleTime / Windows GetLastInputInfo / "
                         "Linux Wayland D-Bus or X11 xprintidle). Fails closed: exits if no sensor works")
     p.add_argument("--allow-no-idle-sensor", action="store_true",
                    help="With --native-idle-seconds: keep running (fail-open, warn) if no HID sensor works")

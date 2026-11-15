@@ -7,7 +7,8 @@ coordinator verbatim via `/worker/preempt`) or None. Sources, in priority order:
 1. `TriggerFileSource`  "trigger_file"      `/tmp/preempt_<worker_id>` exists (chaos tests/demos).
 2. `HIDIdleSource`      "hid_input"         OS HID idle time < N s (opt-in `--native-idle-seconds`).
                         "idle_sensor_lost"  the HID reader that worked at startup keeps failing.
-     * macOS:   IOKit `HIDIdleTime` (nanoseconds) via `ioreg -c IOHIDSystem`
+     * macOS:   IOKit `HIDIdleTime` (nanoseconds), read in-process via ctypes; `ioreg -c
+                IOHIDSystem` (a process spawn per read) only if that fails at startup
      * Windows: user32 `GetLastInputInfo`
      * Linux:   Wayland/GNOME `org.gnome.Mutter.IdleMonitor.GetIdletime` (gdbus), KDE/freedesktop
                 `org.freedesktop.ScreenSaver.GetSessionIdleTime` (gdbus / dbus-send / qdbus),
@@ -110,8 +111,88 @@ def parse_ioreg_hid_idle(output: str) -> Optional[float]:
 
 
 def macos_idle_seconds() -> Optional[float]:
+    """`ioreg` fallback for `iokit_idle_seconds` (spawns a process: ~18 ms of CPU per read)."""
     out = _run(["ioreg", "-c", "IOHIDSystem", "-r", "-d", "1", "-k", "HIDIdleTime"])
     return parse_ioreg_hid_idle(out) if out is not None else None
+
+
+_CF_STRING_ENCODING_UTF8 = 0x08000100
+_CF_NUMBER_SINT64_TYPE = 4
+_KIO_MAIN_PORT_DEFAULT = 0
+
+
+class _IOKitHIDIdle:
+    """Reads IOHIDSystem's `HIDIdleTime` in-process: the same registry property `ioreg -k
+    HIDIdleTime` prints, through IOKit/CoreFoundation via ctypes. About 7 us per read on an M4
+    Max, against ~18 ms of CPU to spawn `ioreg`, which the HID guard used to do twice a second."""
+
+    def __init__(self) -> None:
+        import ctypes
+
+        iokit = ctypes.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
+        cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        vp, u32, ulong = ctypes.c_void_p, ctypes.c_uint32, ctypes.c_ulong
+        iokit.IOServiceMatching.restype, iokit.IOServiceMatching.argtypes = vp, [ctypes.c_char_p]
+        iokit.IOServiceGetMatchingService.restype, iokit.IOServiceGetMatchingService.argtypes = u32, [u32, vp]
+        iokit.IORegistryEntryCreateCFProperty.restype = vp
+        iokit.IORegistryEntryCreateCFProperty.argtypes = [u32, vp, vp, u32]
+        iokit.IOObjectRelease.restype, iokit.IOObjectRelease.argtypes = ctypes.c_int, [u32]
+        cf.CFStringCreateWithCString.restype = vp
+        cf.CFStringCreateWithCString.argtypes = [vp, ctypes.c_char_p, u32]
+        cf.CFGetTypeID.restype, cf.CFGetTypeID.argtypes = ulong, [vp]
+        cf.CFNumberGetTypeID.restype, cf.CFNumberGetTypeID.argtypes = ulong, []
+        cf.CFNumberGetValue.restype = ctypes.c_bool
+        cf.CFNumberGetValue.argtypes = [vp, ctypes.c_long, vp]
+        cf.CFRelease.restype, cf.CFRelease.argtypes = None, [vp]
+        self._ctypes, self._iokit, self._cf = ctypes, iokit, cf
+        # Created once and kept for the life of the process.
+        self._key = cf.CFStringCreateWithCString(None, b"HIDIdleTime", _CF_STRING_ENCODING_UTF8)
+        if not self._key:
+            raise OSError("CFStringCreateWithCString failed")
+        self._number_type = cf.CFNumberGetTypeID()
+
+    def __call__(self) -> Optional[float]:
+        iokit, cf = self._iokit, self._cf
+        # IOServiceGetMatchingService consumes the matching dictionary, so it is built per call.
+        svc = iokit.IOServiceGetMatchingService(_KIO_MAIN_PORT_DEFAULT, iokit.IOServiceMatching(b"IOHIDSystem"))
+        if not svc:
+            return None
+        try:
+            prop = iokit.IORegistryEntryCreateCFProperty(svc, self._key, None, 0)
+            if not prop:
+                return None
+            try:
+                if cf.CFGetTypeID(prop) != self._number_type:
+                    return None
+                ns = self._ctypes.c_int64()
+                if not cf.CFNumberGetValue(prop, _CF_NUMBER_SINT64_TYPE, self._ctypes.byref(ns)):
+                    return None
+                return ns.value / 1e9
+            finally:
+                cf.CFRelease(prop)
+        finally:
+            iokit.IOObjectRelease(svc)
+
+
+_iokit_hid_idle: Optional[_IOKitHIDIdle] = None
+_iokit_load_failed = False
+
+
+def iokit_idle_seconds() -> Optional[float]:
+    """Seconds since the last HID event, read in-process from IOKit; None off macOS or on failure."""
+    global _iokit_hid_idle, _iokit_load_failed
+    if sys.platform != "darwin" or _iokit_load_failed:
+        return None
+    if _iokit_hid_idle is None:
+        try:
+            _iokit_hid_idle = _IOKitHIDIdle()
+        except (OSError, AttributeError):
+            _iokit_load_failed = True
+            return None
+    try:
+        return _iokit_hid_idle()
+    except Exception:
+        return None
 
 
 def windows_idle_seconds() -> Optional[float]:
@@ -196,7 +277,8 @@ def native_idle_candidates(platform: str = sys.platform, env: Optional[Mapping[s
     """
     env = os.environ if env is None else env
     if platform == "darwin":
-        return [IdleReader("ioreg HIDIdleTime", macos_idle_seconds)]
+        return [IdleReader("IOKit HIDIdleTime", iokit_idle_seconds),
+                IdleReader("ioreg HIDIdleTime", macos_idle_seconds)]
     if platform.startswith("win"):
         return [IdleReader("GetLastInputInfo", windows_idle_seconds)]
     if not platform.startswith("linux"):
@@ -233,7 +315,8 @@ def probe_idle_reader(candidates: Iterable[IdleReader]) -> Optional[IdleReader]:
 def idle_sensor_help(platform: str = sys.platform) -> str:
     """How to get a working HID idle reader on `platform` (appended to the fail-closed error)."""
     if platform == "darwin":
-        return "`ioreg -c IOHIDSystem` returned no HIDIdleTime; run the worker inside the logged-in user's session."
+        return ("Neither IOKit nor `ioreg -c IOHIDSystem` returned HIDIdleTime; run the worker inside the "
+                "logged-in user's session.")
     if platform.startswith("win"):
         return ("GetLastInputInfo only sees the interactive desktop; run the worker in the user's session "
                 "(a scheduled task at logon), not as a session-0 service.")
@@ -357,15 +440,33 @@ class GridProcessScanner:
     Processes may vanish or be unreadable between listing and reading; they are skipped. An
     unreadable inference server (e.g. running as another user on macOS) is therefore counted
     as foreign load - the safe direction for a good citizen.
+
+    Listing and naming every process is the expensive part (~19 ms of CPU per call with ~880
+    processes on an M4 Max, once a second, also while the owner is working). So only every
+    `full_scan_s` does a call walk the whole process table. In between, one cheap `psutil.pids()`
+    shows which pids appeared or vanished; only new ones are named and classified, and CPU times
+    are read only for the grid's own handful of processes. A process younger than `settle_s` is
+    re-classified on every call, because right after fork it still carries its parent's name.
+    The periodic full scan catches the rare cases the cheap path cannot see: a pid recycled
+    between two calls, or a long-running process exec'ing into a different program.
     """
 
-    def __init__(self, own_pid: Optional[int] = None, exclude_peers: bool = True):
+    def __init__(self, own_pid: Optional[int] = None, exclude_peers: bool = True,
+                 full_scan_s: float = 30.0, settle_s: float = 2.0,
+                 clock: Callable[[], float] = time.monotonic):
         self.own_pid = os.getpid() if own_pid is None else own_pid
         self.exclude_peers = exclude_peers
+        self.full_scan_s = full_scan_s
+        self.settle_s = settle_s
+        self.clock = clock
+        self.full_scans = 0
         self._peer_cache: dict[tuple[int, float], bool] = {}
+        self._settled: set[int] = set()            # classified pids old enough not to be re-checked
+        self._grid: dict[int, psutil.Process] = {}  # the subset whose CPU is the grid's
+        self._full_scan_at: Optional[float] = None
 
-    def _is_peer(self, p: psutil.Process) -> bool:
-        key = (p.pid, p.info.get("create_time") or 0.0)
+    def _is_peer(self, p: psutil.Process, create_time: float) -> bool:
+        key = (p.pid, create_time)
         if key not in self._peer_cache:
             try:
                 self._peer_cache[key] = is_peer_worker_cmdline(p.cmdline())
@@ -373,22 +474,72 @@ class GridProcessScanner:
                 self._peer_cache[key] = False
         return self._peer_cache[key]
 
-    def __call__(self) -> dict[int, float]:
-        out: dict[int, float] = {}
+    def _classify(self, p: psutil.Process, name: str, create_time: float, now: float) -> None:
+        ours = (p.pid == self.own_pid or is_inference_process(name)
+                or (self.exclude_peers and name.lower().startswith(_PYTHON_NAME_PREFIXES)
+                    and self._is_peer(p, create_time)))
+        if ours:
+            self._grid[p.pid] = p
+        else:
+            self._grid.pop(p.pid, None)
+        if now - create_time >= self.settle_s:
+            self._settled.add(p.pid)
+        else:
+            self._settled.discard(p.pid)
+
+    def _full_scan(self) -> None:
+        self.full_scans += 1
+        self._settled.clear()
+        self._grid.clear()
         live: set[tuple[int, float]] = set()
+        now = time.time()
         for p in psutil.process_iter(["name", "create_time"]):
-            name = p.info.get("name") or ""
-            live.add((p.pid, p.info.get("create_time") or 0.0))
-            ours = (p.pid == self.own_pid or is_inference_process(name)
-                    or (self.exclude_peers and name.lower().startswith(_PYTHON_NAME_PREFIXES) and self._is_peer(p)))
-            if not ours:
-                continue
-            try:
-                t = p.cpu_times()
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                continue
-            out[p.pid] = t.user + t.system
+            create_time = p.info.get("create_time") or 0.0
+            live.add((p.pid, create_time))
+            self._classify(p, p.info.get("name") or "", create_time, now)
         self._peer_cache = {k: v for k, v in self._peer_cache.items() if k in live}
+
+    def _incremental_scan(self) -> None:
+        pids = set(psutil.pids())
+        self._settled &= pids
+        for pid in [pid for pid in self._grid if pid not in pids]:
+            del self._grid[pid]
+        now = time.time()
+        for pid in pids - self._settled:
+            try:
+                p = psutil.Process(pid)
+                name, create_time = p.name(), p.create_time()
+            except psutil.NoSuchProcess:
+                continue
+            except (psutil.AccessDenied, psutil.ZombieProcess):
+                # The full scan would see no name for it either: not ours. Settle it so an
+                # unreadable process is not retried on every call.
+                self._grid.pop(pid, None)
+                self._settled.add(pid)
+                continue
+            self._classify(p, name, create_time, now)
+        self._peer_cache = {k: v for k, v in self._peer_cache.items() if k[0] in pids}
+
+    def __call__(self) -> dict[int, float]:
+        now = self.clock()
+        if self._full_scan_at is None or now - self._full_scan_at >= self.full_scan_s:
+            self._full_scan_at = now
+            self._full_scan()
+        else:
+            self._incremental_scan()
+        out: dict[int, float] = {}
+        for pid, p in list(self._grid.items()):
+            try:
+                if pid != self.own_pid and not p.is_running():  # exited, or its pid was recycled
+                    raise psutil.NoSuchProcess(pid)
+                t = p.cpu_times()
+            except psutil.NoSuchProcess:
+                self._grid.pop(pid, None)
+                self._settled.discard(pid)
+                continue
+            except (psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+            out[pid] = t.user + t.system
         return out
 
 

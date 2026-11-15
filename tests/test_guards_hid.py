@@ -56,7 +56,7 @@ def which_of(*present):
 
 
 def test_candidates_per_platform():
-    assert names(native_idle_candidates("darwin")) == ["ioreg HIDIdleTime"]
+    assert names(native_idle_candidates("darwin")) == ["IOKit HIDIdleTime", "ioreg HIDIdleTime"]
     assert names(native_idle_candidates("win32")) == ["GetLastInputInfo"]
     assert native_idle_candidates("freebsd13", env={}, which=which_of()) == []
     assert native_idle_candidates("linux", env={}, which=which_of()) == []

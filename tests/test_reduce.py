@@ -198,3 +198,17 @@ def test_qdrant_incompatible_collection_fails_without_recreate():
 def test_cosine():
     assert math.isclose(rg.cosine([1, 0], [1, 0]), 1.0)
     assert rg.cosine([1, 0], [0, 0]) == 0.0
+
+
+def test_pair_cosines_matches_cosine():
+    import random
+    rnd = random.Random(7)
+    vecs = [[rnd.uniform(-1, 1) for _ in range(16)] for _ in range(20)] + [[0.0] * 16]
+    pairs = [(i, j) for i in range(len(vecs)) for j in range(len(vecs)) if i < j]
+    got = rg.pair_cosines(vecs, pairs, batch=7)                 # several batches, ragged last one
+    assert len(got) == len(pairs)
+    for (i, j), sim in zip(pairs, got):
+        assert math.isclose(sim, rg.cosine(vecs[i], vecs[j]), abs_tol=1e-12)
+    assert rg.pair_cosines(vecs, [(0, 20)]) == [0.0]            # zero vector -> 0.0, like cosine
+    assert rg.pair_cosines(vecs, []) == []
+    assert all(isinstance(s, float) for s in got)               # plain floats (JSON-safe), not numpy
