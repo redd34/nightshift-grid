@@ -29,3 +29,19 @@ def test_directory_plugin_bundles_no_mcp_server_and_full_one_does():
 def test_marketplace_points_at_full_plugin():
     market = json.loads((ROOT / ".claude-plugin/marketplace.json").read_text())
     assert [p["source"] for p in market["plugins"]] == ["./plugin"]
+
+
+def test_mcp_registry_server_json_matches_package():
+    import json
+    import tomllib
+    root = Path(__file__).resolve().parent.parent
+    server = json.loads((root / "server.json").read_text())
+    version = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
+    assert server["version"] == version
+    pkg = server["packages"][0]
+    assert (pkg["registryType"], pkg["identifier"], pkg["version"]) == ("pypi", "nightshift-grid", version)
+    assert len(server["description"]) <= 100
+    # The registry proves PyPI ownership by finding this line in the package README.
+    assert f"mcp-name: {server['name']}" in (root / "README.md").read_text()
+    scripts = tomllib.loads((root / "pyproject.toml").read_text())["project"]["scripts"]
+    assert scripts["nightshift-grid"] == "mcp_server:main"  # `uvx nightshift-grid` runs the server

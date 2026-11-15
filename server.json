@@ -1,0 +1,42 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.redd34/nightshift-grid",
+  "title": "Nightshift Grid",
+  "description": "Cited knowledge graphs from local documents, extracted by small Ollama models on idle machines.",
+  "repository": {
+    "url": "https://github.com/redd34/nightshift-grid",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/redd34/nightshift-grid",
+  "version": "0.1.3",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "nightshift-grid",
+      "version": "0.1.3",
+      "runtimeHint": "uvx",
+      "transport": { "type": "stdio" },
+      "environmentVariables": [
+        {
+          "name": "NIGHTSHIFT_URL",
+          "description": "Coordinator URL. Leave unset to use the grid started by `nightshift up` on this machine.",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "NIGHTSHIFT_TOKEN_FILE",
+          "description": "File holding the coordinator client token (only needed with NIGHTSHIFT_URL).",
+          "isRequired": false,
+          "format": "filepath"
+        },
+        {
+          "name": "NIGHTSHIFT_MCP_ROOTS",
+          "description": "Folders the server may read documents from (default: the current directory).",
+          "isRequired": false,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}
